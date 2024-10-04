@@ -268,7 +268,7 @@ namespace Sloth
 
             // if chunk size is zero or node depth is maximum, it won't require any child node
             const int chunkSize = ((float)maxKey - (float)minKey) / numChildNodesPerParent;
-            const bool childNodePossible = (chunkSize > 0) && (nodeDepth < nodeMaxDepth);
+            const bool childNodePossible = (chunkSize > 0) && (nodeDepth < nodeMaxDepth) && (inputSize > nodeElements);
 
             // current node's data is already computed from parent. so no more compute necessary
             if (!childNodePossible)
@@ -447,8 +447,8 @@ namespace Sloth
 
             // if chunk size is zero or node depth is maximum, it won't require any child node
             const int chunkSize = ((float)maxKey - (float)minKey) / numChildNodesPerParent;
-            const bool childNodePossible = (chunkSize > 0) && (nodeDepth < nodeMaxDepth);
-
+            const bool childNodePossible = (chunkSize > 0) && (nodeDepth < nodeMaxDepth) && (inputSize > nodeElements);
+            
             // current node's data is already computed from parent. so no more compute necessary
             if (!childNodePossible)
             {
@@ -674,39 +674,42 @@ namespace Sloth
                     int curRangeStart = childNodeRangeStart[i];
                     int curRangeStop = childNodeRangeStop[i];
 
-                    if (taskQueueUsed[taskBegin + 7 + i + numChildNodesPerParent] > nodeElements)
-                    {
+                    tree[childNodeOffset[i]] = inputSize;
+                    tree[childNodeOffset[i] + 1] = curRangeStart;
+                    tree[childNodeOffset[i] + 2] = curRangeStop;
+                    tree[childNodeOffset[i] + 3] = taskQueueUsed[taskBegin + 7 + i]; // todo: debug this
+                    tree[childNodeOffset[i] + 4] = 0; // reserved
+                    /*
+                    
+                                tree[0]: allocator counter for nodes
+                                tree[1]: allocator counter for elements
+                                int-0: number of elements if its a leaf node
+                                int-1: min key
+                                int-2: max key
+                                int-3: element begin in element buffer
+                                int-4:
+                    */
+                 
+                    const int allocatedTaskIndex = atomicAdd(&taskQueueGenerated[0], 1) * numTaskParameters + 1;
 
-                        tree[childNodeOffset[i]] = 0;
-                        tree[childNodeOffset[i] + 1] = curRangeStart;
-                        tree[childNodeOffset[i] + 2] = curRangeStop;
-                        tree[childNodeOffset[i] + 3] = nodeElementOffsets[i]; // todo: debug this
-                        tree[childNodeOffset[i] + 4] = 0; // reserved
-
-
-
-                        const int allocatedTaskIndex = atomicAdd(&taskQueueGenerated[0], 1) * numTaskParameters + 1;
-
-
-                        /*
-
-                                    taskQueueHost[1] = nodeTreeHeader; // offset
-                                    taskQueueHost[2] = 0; // node depth
-                                    taskQueueHost[3] = 1; // its input is input array, not another node
-                                    taskQueueHost[4] = 0; // element starting index in tree's element buffer
-                                    taskQueueHost[5] = minMaxHost[0]; // range start
-                                    taskQueueHost[6] = minMaxHost[1]; // range stop
-                                    taskQueueHost[7] = inputSize; // number of elements to scan
-                        */
-
-                        taskQueueGenerated[allocatedTaskIndex] = childNodeOffset[i]; // offset of the task itself
-                        taskQueueGenerated[allocatedTaskIndex + 1] = nodeDepth + 1; // child node depth
-                        taskQueueGenerated[allocatedTaskIndex + 2] = 0; // child node ==> 0 means it uses tree's buffer instead of input buffer
-                        taskQueueGenerated[allocatedTaskIndex + 3] = taskQueueUsed[taskBegin + 7 + i]; // element starting index in tree's element buffer
-                        taskQueueGenerated[allocatedTaskIndex + 4] = curRangeStart; // key range start
-                        taskQueueGenerated[allocatedTaskIndex + 5] = curRangeStop; // key range stop
-                        taskQueueGenerated[allocatedTaskIndex + 6] = taskQueueUsed[taskBegin + 7 + i + numChildNodesPerParent]; // num elements to scan
-                    }
+                    taskQueueGenerated[allocatedTaskIndex] = childNodeOffset[i]; // offset of node
+                    taskQueueGenerated[allocatedTaskIndex + 1] = nodeDepth + 1; // child node depth
+                    taskQueueGenerated[allocatedTaskIndex + 2] = 0; // child node ==> 0 means it uses tree's buffer instead of input buffer
+                    taskQueueGenerated[allocatedTaskIndex + 3] = taskQueueUsed[taskBegin + 7 + i]; // element starting index in tree's element buffer
+                    taskQueueGenerated[allocatedTaskIndex + 4] = curRangeStart; // key range start
+                    taskQueueGenerated[allocatedTaskIndex + 5] = curRangeStop; // key range stop
+                    taskQueueGenerated[allocatedTaskIndex + 6] = taskQueueUsed[taskBegin + 7 + i + numChildNodesPerParent]; // num elements to scan
+                 /*
+                 
+                                taskQueueHost[1] = TreeInternalKernels::nodeTreeHeader; // offset
+                                taskQueueHost[2] = 0; // node depth
+                                taskQueueHost[3] = 1; // its input is input array, not another node
+                                taskQueueHost[4] = 0; // element starting index in tree's element buffer
+                                taskQueueHost[5] = minMaxHost[0]; // range start
+                                taskQueueHost[6] = minMaxHost[1]; // range stop
+                                taskQueueHost[7] = inputSize; // number of elements to scan
+                 
+                 */
                 }
             }
         }
@@ -952,8 +955,9 @@ namespace Sloth
                         std::cout << "number of tasks = " << numTasks<< "    compute resource per task = "<< taskComputeResource << std::endl;
                         
                     }
+                    break;
                 }
-                cudaDeviceSynchronize();
+               
 
 
             }
@@ -969,7 +973,7 @@ namespace Sloth
                     sum += taskQueueHost[8 + TreeInternalKernels::numChildNodesPerParent + k];
                 std::cout << "n = " << sum << std::endl;
                 std::vector<KeyType> keyTmp(inputSize);
-                if (pingPongState == 0)
+                if (pingPongState == 1)
                     cudaMemcpy(keyTmp.data(), treeKey->Data(), inputSize * sizeof(KeyType), cudaMemcpyDeviceToHost);
                 else
                     cudaMemcpy(keyTmp.data(), treeKey->Data() + inputSize, inputSize * sizeof(KeyType), cudaMemcpyDeviceToHost);
