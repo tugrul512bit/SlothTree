@@ -74,6 +74,11 @@ namespace Sloth
 			gpuErrchk(cudaMemcpy(ptr,data,numElements*sizeof(Type),cudaMemcpyDeviceToHost));
 		}
 
+		void DeviceCopyTo(Type* ptr, const int numElements)
+		{
+			gpuErrchk(cudaMemcpy(ptr, data, numElements * sizeof(Type), cudaMemcpyDeviceToDevice));
+		}
+
 		void CopyFrom(Type* ptr, const int numElements)
 		{
 			gpuErrchk(cudaMemcpy(data,ptr, numElements * sizeof(Type), cudaMemcpyHostToDevice));
