@@ -2,13 +2,13 @@
 int main()
 {
 
-        int n = 1000000;
+        int n = 300000;
         Sloth::Tree<int, int> tree;
         std::vector<int> key(n);
         std::vector<int> value(n);
         for (int i = 0; i < n; i++)
         {
-            key[i] = rand();
+            key[i] = rand();//*rand()+rand();
             value[i] = i;
         }
         for (int i = 0; i < 10; i++)
