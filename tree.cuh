@@ -331,7 +331,7 @@ namespace Sloth
             const int chunkId = loadSingle(taskInChunkId, smLoadInt, tid);
             const int totalWorkSize = loadSingle(chunkLength + chunkId, smLoadInt, tid);
             const int chunkTasks = loadSingle(chunkNumTasks + chunkId, smLoadInt, tid);
-            const int chunkOfs = loadSingle(chunkOffset + chunkId, smLoadInt, tid);
+            const int chunkOfs = loadSingle(chunkOffset + chunkId, smLoadInt, tid); 
             const KeyType chunkMin = loadSingle(chunkRangeMin + chunkId, smLoadInt, tid);
             const KeyType chunkMax = loadSingle(chunkRangeMax + chunkId, smLoadInt, tid);
 
