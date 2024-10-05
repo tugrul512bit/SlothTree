@@ -2,7 +2,7 @@
 int main()
 {
 
-        int n = 300000;
+        int n = 10000000;
         Sloth::Tree<int, int> tree;
         std::vector<int> key(n);
         std::vector<int> value(n);

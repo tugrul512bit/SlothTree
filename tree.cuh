@@ -14,8 +14,9 @@ namespace Sloth
 
 
 
-        // each task is computed by multiple blocks of threads
-        static constexpr int nodeThreads = 128;
+        // each task is 1 block of threads
+        // each chunk can have multiple tasks
+        static constexpr int taskThreads = 128;
         static constexpr int nodeElements = 128;
         static constexpr int nodeMaxDepth = 10;
         static constexpr int numChildNodesPerParent =2;
@@ -30,7 +31,7 @@ namespace Sloth
                 sm[id] = val;
                 __syncthreads();
                 // shared reduction
-                for (unsigned int i = ((unsigned int)nodeThreads) >> 1; i > 16; i >>= 1)
+                for (unsigned int i = ((unsigned int)taskThreads) >> 1; i > 16; i >>= 1)
                 {
                     if (id < i)
                         sm[id] += sm[id + i];
@@ -59,7 +60,7 @@ namespace Sloth
             {
                 sm[id] = val;
                 __syncthreads();
-                for (unsigned int i = ((unsigned int)nodeThreads) >> 1; i > 0; i >>= 1)
+                for (unsigned int i = ((unsigned int)taskThreads) >> 1; i > 0; i >>= 1)
                 {
                     if (id < i)
                     {
@@ -82,7 +83,7 @@ namespace Sloth
             {
                 sm[id] = val;
                 __syncthreads();
-                for (unsigned int i = ((unsigned int)nodeThreads) >> 1; i > 0; i >>= 1)
+                for (unsigned int i = ((unsigned int)taskThreads) >> 1; i > 0; i >>= 1)
                 {
                     if (id < i)
                     {
@@ -113,12 +114,12 @@ namespace Sloth
                 if (id == 0)
                 {
                     smMask[0] = 0;
-                    smMask[nodeThreads + 1] = 0;
+                    smMask[taskThreads + 1] = 0;
                 }
                 __syncthreads();
                 int gatherDistance = 1;
 
-                while (gatherDistance < nodeThreads)
+                while (gatherDistance < taskThreads)
                 {
                     TypeMask msk = smMask[id + 1];
                     if (id + 1 - gatherDistance >= 0)
@@ -154,12 +155,12 @@ namespace Sloth
                 if (id == 0)
                 {
                     smMask[0] = 0;
-                    smMask[nodeThreads + 1] = 0;
+                    smMask[taskThreads + 1] = 0;
                 }
                 __syncthreads();
                 int gatherDistance = 1;
 
-                while (gatherDistance < nodeThreads)
+                while (gatherDistance < taskThreads)
                 {
                     TypeMask msk = smMask[id + 1];
                     if (id + 1 - gatherDistance >= 0)
@@ -224,7 +225,7 @@ namespace Sloth
                         keyMax = keyData;
                 }
             }
-            __shared__ KeyType sm[nodeThreads];
+            __shared__ KeyType sm[taskThreads];
             Reducer<KeyType> reducer;
             const KeyType minData = reducer.BlockMin(tid, keyMin, sm);
             const KeyType maxData = reducer.BlockMax(tid, keyMax, sm);
@@ -235,6 +236,8 @@ namespace Sloth
             }
         }
 
+        // single global load operation
+        // broadcasted from shared memory to all threads in block
         template<typename Type>
         __device__ Type loadSingle(Type * ptr,Type * ptrSm, const int id)
         {
@@ -244,6 +247,7 @@ namespace Sloth
             }
             __syncthreads();
             const Type result = *ptrSm;
+            __syncthreads();
             return result;
         }
 
@@ -255,20 +259,34 @@ namespace Sloth
         template<typename KeyType, typename ValueType>
         __global__ void createChunks(
             int * taskInCounter, int * taskInChunkId,
-            int * chunkLength, int * chunkProgress,
-            KeyType * keyIn, ValueType * valueIn, KeyType * keyOut, KeyType * valueOut
+            int * chunkLength, int * chunkProgress, int * chunkNumTasks,
+            KeyType * keyIn, ValueType * valueIn, KeyType * keyOut, KeyType * valueOut,
+            int * taskOutCounter
         )
         {
             const int tid = threadIdx.x;
             const int bid = blockIdx.x;
             const int bs = blockDim.x;
             const int gs = gridDim.x;
+            const int thread = tid + bid * bs;
             __shared__ int smLoadInt[1];
             const int chunkId = loadSingle(taskInChunkId, smLoadInt, tid);
             const int totalWorkSize = loadSingle(chunkLength + chunkId, smLoadInt, tid);
+            const int chunkTasks = loadSingle(chunkNumTasks + chunkId, smLoadInt, tid);
 
-            if(tid==0)
-                printf(" (chunk id = %i   work size = %i) ", chunkId,totalWorkSize);
+            // chunk is processed in multiple leaps of this stride 
+            const int chunkStride = taskThreads * chunkTasks;
+            const int strideThreadId = tid + (bid % chunkTasks)*bs; // this allows variable amount of tasks per chunk within same kernel
+            const int numStrides = 1 + (totalWorkSize - 1) / chunkStride;
+            for (int i = 0; i < numStrides; i++)
+            {
+                const int currentId = strideThreadId + i * chunkStride;
+                if (currentId < totalWorkSize)
+                {
+                    atomicAdd(&taskOutCounter[0], 1);
+                }
+            }
+
 
         }
   
@@ -289,7 +307,8 @@ namespace Sloth
         std::shared_ptr<Sloth::Buffer<int>> taskOutCounter;
         std::shared_ptr<Sloth::Buffer<int>> taskOutChunkId;
 
-
+        std::shared_ptr<Sloth::Buffer<int>> chunkCounter;
+        std::shared_ptr<Sloth::Buffer<int>> chunkNumTasks;
         std::shared_ptr<Sloth::Buffer<int>> chunkLength;
         std::shared_ptr<Sloth::Buffer<int>> chunkProgress; // tasks atomically use this to get more work
 
@@ -318,6 +337,8 @@ namespace Sloth
             taskInChunkId = std::make_shared< Sloth::Buffer<int>>("taskInChunkId", maxTasks, 0, false);
             taskOutChunkId = std::make_shared< Sloth::Buffer<int>>("taskOutChunkId", maxTasks, 0, false);
 
+            chunkCounter = std::make_shared< Sloth::Buffer<int>>("chunkCounter", 1, 0, false);
+            chunkNumTasks = std::make_shared< Sloth::Buffer<int>>("chunkNumTasks", maxChunks, 0, false);
             chunkLength = std::make_shared< Sloth::Buffer<int>>("chunkLength", maxChunks, 0, false);
             chunkProgress = std::make_shared< Sloth::Buffer<int>>("chunkProgress", maxChunks, 0, false);
 		}
@@ -340,21 +361,36 @@ namespace Sloth
 
 
                 // starting n tasks depending on chunk length
-                const int nTasks = 1 + (inputSize / ( 16*TreeInternalKernels::nodeThreads));
-                taskInCounter->Set(0, nTasks);                
+                const int nTasks = 1 + (inputSize / ( 16*TreeInternalKernels::taskThreads));
+             
+                // first chunk = input array
+                // number of chunks = 1 as input
+                chunkCounter->Set(0, 1);
+
+                chunkNumTasks->Set(0, nTasks);
                 chunkLength->Set(0, inputSize);
                 chunkProgress->Set(0, 0);
+
+
+                // number of tasks launched
+                taskInCounter->Set(0, nTasks);
+                std::vector<int> tasks(nTasks);
                 for (int i = 0; i < nTasks; i++)
                 {                    
-                    taskInChunkId->Set(i, 0);                    
+                    tasks[i] = 0;
+                    
                 }
+                taskInChunkId->CopyFrom(tasks.data(),nTasks);
                 
-                TreeInternalKernels::createChunks<<<nTasks, TreeInternalKernels::nodeThreads>>>(
+                taskOutCounter->Set(0, 0);
+                TreeInternalKernels::createChunks<<<nTasks, TreeInternalKernels::taskThreads>>>(
                     taskInCounter->Data(), taskInChunkId->Data(),
-                    chunkLength->Data(), chunkProgress->Data(),
-                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data()
+                    chunkLength->Data(), chunkProgress->Data(),chunkNumTasks->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data()
                 );
-                
+                gpuErrchk(cudaDeviceSynchronize());
+                std::cout << taskOutCounter->Get(0) << std::endl;
             }
             std::cout << "gpu: " << t / 1000000000.0 << "s" << std::endl;
 
