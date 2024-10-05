@@ -25,6 +25,7 @@ int main()
                     map[key[j]] = value[j];
             }
             std::cout << "cpu: " << t / 1000000000.0 << "s" << std::endl;
+            
         }
     return 0;
 }
