@@ -20,8 +20,8 @@ namespace Sloth
         // each chunk can have multiple tasks
         static constexpr int taskThreads = 128;
         static constexpr int nodeElements = 128;
-        static constexpr int nodeMaxDepth = 5;
-        static constexpr int numChildNodesPerParent =32;
+        static constexpr int nodeMaxDepth = 10;
+        static constexpr int numChildNodesPerParent =4;
         
        
 
@@ -143,6 +143,55 @@ namespace Sloth
                 Type result = sm2[id];
                 __syncthreads();
                 return result;
+            }
+
+            template<typename Type2>
+            __device__ Type BlockCompactKeyValue(
+                Type key, Type value, 
+                bool mask, 
+                Type* smKey, Type* smKey2, 
+                Type* smValue, Type* smValue2,
+                TypeMask* smMask, 
+                const int id,
+                Type * resultKey,
+                Type2 * resultVal)
+            {
+
+                smKey[id] = key;
+                smValue[id] = value;
+                smMask[id + 1] = mask;
+                if (id == 0)
+                {
+                    smMask[0] = 0;
+                    smMask[taskThreads + 1] = 0;
+                }
+                __syncthreads();
+                int gatherDistance = 1;
+
+                while (gatherDistance < taskThreads)
+                {
+                    TypeMask msk = smMask[id + 1];
+                    if (id + 1 - gatherDistance >= 0)
+                        msk += smMask[id + 1 - gatherDistance];
+                    __syncthreads();
+                    smMask[id + 1] = msk;
+                    gatherDistance <<= 1;
+                    __syncthreads();
+                }
+
+                __syncthreads();
+
+                if (smMask[id] == smMask[id + 1] - 1)
+                {
+                    smKey2[smMask[id + 1] - 1] = smKey[id];
+                    smValue2[smMask[id + 1] - 1] = smValue[id];
+                }
+
+                __syncthreads();
+                *resultKey = smKey2[id];
+                *resultVal = smValue2[id];
+                __syncthreads();
+
             }
 
             template<typename Type2>
@@ -271,7 +320,7 @@ namespace Sloth
         __global__ void computeChildChunkAllocationRequirements(
             int * taskInCounter, int * taskInChunkId,
             int * chunkLength, int * chunkProgress, int * chunkNumTasks, int * chunkOffset,
-            KeyType * chunkRangeMin, KeyType * chunkRangeMax,
+            KeyType * chunkRangeMin, KeyType * chunkRangeMax, int* chunkCounter,
             KeyType * keyIn, ValueType * valueIn, KeyType * keyOut, KeyType * valueOut,
             int * taskOutCounter,
             int * debugBuffer
@@ -359,14 +408,72 @@ namespace Sloth
                     atomicAdd(&chunkLength[childChunkIndex], sum);
 
                 }
+
+                // only 1 thread of chunk is resetting this value for later kernels
+                if (strideThreadId == 0)
+                {
+                    chunkCounter[childChunkIndex] = 0;
+                }
             }
         }
+
+
+        template<typename KeyType, typename ValueType>
+        __global__ void computeChildChunkOffset(
+            int* taskInCounter, int* taskInChunkId,
+            int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
+            KeyType* chunkRangeMin, KeyType* chunkRangeMax,
+            KeyType* keyIn, ValueType* valueIn, KeyType* keyOut, KeyType* valueOut,
+            int* taskOutCounter,
+            int* debugBuffer
+        )
+        {
+
+            const int tid = threadIdx.x;
+            const int bid = blockIdx.x;
+            const int bs = blockDim.x;
+            const int gs = gridDim.x;
+            const int thread = tid + bid * bs;
+            __shared__ int smLoadInt[1];
+            const int chunkId = loadSingle(taskInChunkId, smLoadInt, tid);
+            const int totalWorkSize = loadSingle(chunkLength + chunkId, smLoadInt, tid);
+            const int chunkTasks = loadSingle(chunkNumTasks + chunkId, smLoadInt, tid);
+            const int chunkOfs = loadSingle(chunkOffset + chunkId, smLoadInt, tid);
+            const KeyType chunkMin = loadSingle(chunkRangeMin + chunkId, smLoadInt, tid);
+            const KeyType chunkMax = loadSingle(chunkRangeMax + chunkId, smLoadInt, tid);
+
+            // if parent range is [0,640] and if there are 64 children per node, then each child will have 10 sized range, [0,9],[10,19],...
+            const int chunkChildRange = ((double)chunkMax - (double)chunkMin) / numChildNodesPerParent;
+
+            // if ranges are too small or if it is a leaf-node, do not create child nodes
+            if ((chunkChildRange < 1) || (totalWorkSize <= taskThreads))
+                return;
+
+            const int strideThreadId = tid + (bid % chunkTasks) * bs; // this allows variable amount of tasks per chunk within same kernel
+  
+            // calculate offsets of child chunks  from their sizes, within parent's region
+            int runningSum = 0;
+            // uses complete-tree definition to traverse tree without gaps. it has all children or none.
+            const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
+            if (strideThreadId == 0)
+            {
+                for (int j = 0; j < numChildNodesPerParent; j++)
+                {
+                    // chunkId: zero based. tree-traversal: one based +1 -1
+                    const int childChunkIndex = childChunkIndexStart + j;
+                    // computed child offset + parent offset = absolute child offset
+                    chunkOffset[childChunkIndex] = runningSum + chunkOfs;
+                    runningSum += chunkLength[childChunkIndex]; // todo: optimize this with shared memory or registers
+                }
+            }
+        }
+
 
         template<typename KeyType, typename ValueType>
         __global__ void allocateChildChunkAndCopy(
             int* taskInCounter, int* taskInChunkId,
             int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
-            KeyType* chunkRangeMin, KeyType* chunkRangeMax,
+            KeyType* chunkRangeMin, KeyType* chunkRangeMax, int * chunkCounter,
             KeyType* keyIn, ValueType* valueIn, KeyType* keyOut, KeyType* valueOut,
             int* taskOutCounter,
             int* debugBuffer
@@ -418,6 +525,14 @@ namespace Sloth
                 curBegin = curEnd + 1;
             }
 
+            int absoluteChildChunkOffsets[numChildNodesPerParent];
+            const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
+            for (int j = 0; j < numChildNodesPerParent; j++)
+            {
+                // chunkId: zero based. tree-traversal: one based +1 -1
+                const int childChunkIndex = childChunkIndexStart + j;
+                absoluteChildChunkOffsets[j] = chunkOffset[childChunkIndex];
+            }
 
             Reducer<int> reducerInt;
             __shared__ int smReductionInt[taskThreads];
@@ -428,73 +543,64 @@ namespace Sloth
             __shared__ KeyType smCompactionKey2[taskThreads + 2];
             __shared__ ValueType smCompactionValue2[taskThreads + 2];
             __shared__ int smMaskCompaction[taskThreads + 2];
-            __shared__ char smCompactionChunkSelection[taskThreads + 2];
-            __shared__ char smCompactionChunkSelection2[taskThreads + 2];
-            
-            int childChunkOffsets[numChildNodesPerParent];
-            for (int j = 0; j < numChildNodesPerParent; j++)
-                childChunkOffsets[j] = 0;
+
+            __shared__ int smTargetIndex;
+
             for (int i = 0; i < numStrides; i++)
             {
                 const int currentId = strideThreadId + i * chunkStride;
-                int newElementFound = 0;
+                int newElementFound[numChildNodesPerParent];
+                for (int j = 0; j < numChildNodesPerParent; j++)
+                    newElementFound[j] = 0;
                 KeyType key;
                 ValueType value;
                 if (currentId < totalWorkSize)
                 {
                     key = keyIn[currentId + chunkOfs];
                     value = valueIn[currentId + chunkOfs];
-                    newElementFound = (key >= chunkMin && key <= chunkMax);
-                }
-                char childChunkSelected = -1;
-                for (int j = 0; j < numChildNodesPerParent; j++)
-                {
-                    if (key >= childNodeRangeMin[j] && key <= childNodeRangeMax[j])
-                        childChunkSelected = j;
-                }
-                const int nCompacted = reducerInt.BlockSum(tid, newElementFound, smReductionInt);
 
-                char chunkSelectionCompacted;
-                KeyType keyCompacted;
-                ValueType valueCompacted;
-                compacter.BlockCompact2(
-                    key, value, 
-                    newElementFound, 
-                    smCompactionKey, smCompactionValue, 
-                    smCompactionKey2,smCompactionValue2,
-                    smMaskCompaction, 
-                    tid, 
-                    &keyCompacted, &valueCompacted, 
-                    smCompactionChunkSelection, smCompactionChunkSelection2, 
-                    childChunkSelected, &chunkSelectionCompacted);
-
+                    for (int j = 0; j < numChildNodesPerParent; j++)
+                    {
+                        if (key >= childNodeRangeMin[j] && key <= childNodeRangeMax[j])
+                            newElementFound[j] = (key >= chunkMin && key <= chunkMax);
+                    }
+                }
              
-                // calculate offsets of child chunks  from their sizes, within parent's region
-                int runningSum = 0;
-                // uses complete-tree definition to traverse tree without gaps. it has all children or none.
-                const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
                 for (int j = 0; j < numChildNodesPerParent; j++)
                 {
-                    // chunkId: zero based. tree-traversal: one based +1 -1
-                    const int childChunkIndex = childChunkIndexStart + j;
-                    // shared reduction
-                    const int sum = reducerInt.BlockSum(tid, newElementFound[j], smReductionInt);
+                    const int nCompacted = reducerInt.BlockSum(tid, newElementFound[j], smReductionInt);
 
+
+                    KeyType keyCompacted;
+                    ValueType valueCompacted;
+                    compacter.BlockCompactKeyValue(
+                        key, value,
+                        newElementFound[j],
+                        smCompactionKey, smCompactionKey2,
+                        smCompactionValue, smCompactionValue2,
+                        smMaskCompaction,
+                        tid,
+                        &keyCompacted,
+                        &valueCompacted);
+
+
+                    const int targetOffset = absoluteChildChunkOffsets[j];
+                    const int childChunkIndex = childChunkIndexStart + j;
                     if (tid == 0)
                     {
-                        // global reduction
-                        atomicAdd(&chunkLength[childChunkIndex], sum);
-
+                        smTargetIndex = atomicAdd(&chunkCounter[childChunkIndex], nCompacted); // reducing global atomics by nCompacted times
                     }
-                    runningSum += chunkLength[childChunkIndex]; // todo: optimize this with shared memory or registers
+                    __syncthreads();
+                    const int targetIndex = smTargetIndex;
+
+                    if (tid < nCompacted)
+                    {                        
+                        keyOut[tid + targetOffset + targetIndex];
+                        valueOut[tid + targetOffset + targetIndex];
+                    }
                 }
 
-                // write values to out
-                for (int j = 0; j < numWrite; j++)
-                {
-
-                    keyOut[childOfs + chunkOfs + j];
-                }
+                
 
             }
 
@@ -516,6 +622,7 @@ namespace Sloth
         {
             debugBuffer[threadIdx.x + blockIdx.x * blockDim.x] = 0;
         }
+
   
     }
 
@@ -578,7 +685,7 @@ namespace Sloth
             taskInChunkId = std::make_shared< Sloth::Buffer<int>>("taskInChunkId", maxTasks, 0, false);
             taskOutChunkId = std::make_shared< Sloth::Buffer<int>>("taskOutChunkId", maxTasks, 0, false);
 
-            chunkCounter = std::make_shared< Sloth::Buffer<int>>("chunkCounter", 1, 0, false);
+            chunkCounter = std::make_shared< Sloth::Buffer<int>>("chunkCounter", maxChunks, 0, false);
             chunkNumTasks = std::make_shared< Sloth::Buffer<int>>("chunkNumTasks", maxChunks, 0, false);
             chunkOffset = std::make_shared< Sloth::Buffer<int>>("chunkOffset", maxChunks, 0, false);
             chunkLength = std::make_shared< Sloth::Buffer<int>>("chunkLength", maxChunks, 0, false);
@@ -630,8 +737,8 @@ namespace Sloth
                 cudaDeviceSynchronize();
 
                 // first chunk = input array
-                // number of chunks = 1 as input
-                chunkCounter->Set(0, 1);
+                // counter is to coordinate target writing form multiple inputs (multiple threads)
+                chunkCounter->Set(0, 0);
                 chunkRangeMin->Set(0, inputMinMax->Get(0));
                 chunkRangeMax->Set(0, inputMinMax->Get(1));
                 chunkNumTasks->Set(0, nTasks);
@@ -651,21 +758,29 @@ namespace Sloth
                 taskInChunkId->CopyFrom(tasks.data(),nTasks);
                 
                 taskOutCounter->Set(0, 0);
-                
+
                 TreeInternalKernels::computeChildChunkAllocationRequirements <<<nTasks, TreeInternalKernels::taskThreads>>>(
                     taskInCounter->Data(), taskInChunkId->Data(),
                     chunkLength->Data(), chunkProgress->Data(),chunkNumTasks->Data(),chunkOffset->Data(),
-                    chunkRangeMin->Data(), chunkRangeMax->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(),
                     keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
                     taskOutCounter->Data(),
                     debugBuffer->Data()
                 );
 
+                TreeInternalKernels::computeChildChunkOffset << <nTasks, TreeInternalKernels::taskThreads >> > (
+                    taskInCounter->Data(), taskInChunkId->Data(),
+                    chunkLength->Data(), chunkProgress->Data(), chunkNumTasks->Data(), chunkOffset->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data(),
+                    debugBuffer->Data()
+                    );
 
                 TreeInternalKernels::allocateChildChunkAndCopy <<<nTasks, TreeInternalKernels::taskThreads >>> (
                     taskInCounter->Data(), taskInChunkId->Data(),
                     chunkLength->Data(), chunkProgress->Data(), chunkNumTasks->Data(), chunkOffset->Data(),
-                    chunkRangeMin->Data(), chunkRangeMax->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(),
                     keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
                     taskOutCounter->Data(),
                     debugBuffer->Data()
@@ -678,7 +793,13 @@ namespace Sloth
 #ifdef SLOTH_DEBUG_ENABLED
                 std::cout << "input range min: " << inputMinMax->Get(0) << std::endl;
                 std::cout << "input range max: " << inputMinMax->Get(1) << std::endl;
-
+                int sum = 0;
+                for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
+                {
+                    sum += chunkCounter->Get(1 + i);
+                    std::cout << " total processed: " << chunkCounter->Get(1 + i) << std::endl;
+                }
+                std::cout << "sum = " << sum << std::endl;
                 std::cout << "-------------------------------" << std::endl;
 #endif
             }

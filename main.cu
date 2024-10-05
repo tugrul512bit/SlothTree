@@ -3,7 +3,7 @@
 int main()
 {
 
-        int n = 1000;
+        int n = 1000000;
         Sloth::Tree<int, int> tree;
         std::unordered_map<int, int> map;
         std::vector<int> key(n);
