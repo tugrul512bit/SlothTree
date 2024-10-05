@@ -146,8 +146,16 @@ namespace Sloth
             }
 
             template<typename Type2>
-            __device__ void BlockCompact2(Type val, Type2 val0, bool mask, Type* sm, Type2* sm0, Type* sm2, Type2* sm20,
-                TypeMask* smMask, const int id, Type* out1, Type2* out2, char* smChunkTracking, char* smChunkTracking2, char chunkId, char* outChunk)
+            __device__ void BlockCompact2(
+                Type val, Type2 val0, 
+                bool mask, 
+                Type* sm, Type2* sm0, 
+                Type* sm2, Type2* sm20,
+                TypeMask* smMask, 
+                const int id, 
+                Type* out1, Type2* out2, 
+                char* smChunkTracking, char* smChunkTracking2, 
+                char chunkId, char* outChunk)
             {
 
                 sm[id] = val;
@@ -256,8 +264,8 @@ namespace Sloth
 
 
         /* 
-            creates node from current task group
-            counts children nodes elements if necessary
+            pseudo-allocation on array requires a measurement
+            counts children elements required to copy
         */ 
         template<typename KeyType, typename ValueType>
         __global__ void computeChildChunkAllocationRequirements(
@@ -311,13 +319,6 @@ namespace Sloth
                     curEnd = chunkMax;
                 childNodeRangeMin[i] = curBegin;
                 childNodeRangeMax[i] = curEnd;
-#ifdef SLOTH_DEBUG_ENABLED
-                if (strideThreadId == 0)
-                {
-                    debugBuffer[100 + i * 2] = curBegin;
-                    debugBuffer[100 + i * 2 + 1] = curEnd;
-                }
-#endif
                 curBegin = curEnd + 1;
             }
 
@@ -341,8 +342,164 @@ namespace Sloth
                     for (int j = 0; j < numChildNodesPerParent; j++)
                         newElementFound[j] += (key >= childNodeRangeMin[j] && key <= childNodeRangeMax[j]);
                 }
+            }
+
+            // uses complete-tree definition to traverse tree without gaps. it has all children or none.
+            const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
+            for (int j = 0; j < numChildNodesPerParent; j++)
+            {
+                // chunkId: zero based. tree-traversal: one based +1 -1
+                const int childChunkIndex = childChunkIndexStart + j;
+                // shared reduction
+                const int sum = reducerInt.BlockSum(tid, newElementFound[j], smReductionInt);
+
+                if (tid == 0)
+                {
+                    // global reduction
+                    atomicAdd(&chunkLength[childChunkIndex], sum);
+
+                }
+            }
+        }
+
+        template<typename KeyType, typename ValueType>
+        __global__ void allocateChildChunkAndCopy(
+            int* taskInCounter, int* taskInChunkId,
+            int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
+            KeyType* chunkRangeMin, KeyType* chunkRangeMax,
+            KeyType* keyIn, ValueType* valueIn, KeyType* keyOut, KeyType* valueOut,
+            int* taskOutCounter,
+            int* debugBuffer
+        )
+        {
+          
+            const int tid = threadIdx.x;
+            const int bid = blockIdx.x;
+            const int bs = blockDim.x;
+            const int gs = gridDim.x;
+            const int thread = tid + bid * bs;
+            __shared__ int smLoadInt[1];
+            const int chunkId = loadSingle(taskInChunkId, smLoadInt, tid);
+            const int totalWorkSize = loadSingle(chunkLength + chunkId, smLoadInt, tid);
+            const int chunkTasks = loadSingle(chunkNumTasks + chunkId, smLoadInt, tid);
+            const int chunkOfs = loadSingle(chunkOffset + chunkId, smLoadInt, tid);
+            const KeyType chunkMin = loadSingle(chunkRangeMin + chunkId, smLoadInt, tid);
+            const KeyType chunkMax = loadSingle(chunkRangeMax + chunkId, smLoadInt, tid);
+
+            // if parent range is [0,640] and if there are 64 children per node, then each child will have 10 sized range, [0,9],[10,19],...
+            const int chunkChildRange = ((double)chunkMax - (double)chunkMin) / numChildNodesPerParent;
+
+
+
+            // if ranges are too small or if it is a leaf-node, do not create child nodes
+            if ((chunkChildRange < 1) || (totalWorkSize <= taskThreads))
+                return;
+           
+
+            // chunk is processed in multiple leaps of this stride 
+            const int chunkStride = taskThreads * chunkTasks;
+            const int strideThreadId = tid + (bid % chunkTasks) * bs; // this allows variable amount of tasks per chunk within same kernel
+            const int numStrides = 1 + (totalWorkSize - 1) / chunkStride;
+
+            // each child-node has its own key range to compare so every deeper node will have a closer number to target when searching a number
+            // inclusive values
+            KeyType childNodeRangeMin[numChildNodesPerParent];
+            KeyType childNodeRangeMax[numChildNodesPerParent];
+            // preparing min-max range per child
+            KeyType curBegin = chunkMin;
+
+            for (int i = 0; i < numChildNodesPerParent; i++)
+            {
+                int curEnd = curBegin + chunkChildRange;
+                if (i == numChildNodesPerParent - 1)
+                    curEnd = chunkMax;
+                childNodeRangeMin[i] = curBegin;
+                childNodeRangeMax[i] = curEnd;
+                curBegin = curEnd + 1;
+            }
+
+
+            Reducer<int> reducerInt;
+            __shared__ int smReductionInt[taskThreads];
+
+            StreamCompacter<KeyType, int> compacter;
+            __shared__ KeyType smCompactionKey[taskThreads + 2];
+            __shared__ ValueType smCompactionValue[taskThreads + 2];
+            __shared__ KeyType smCompactionKey2[taskThreads + 2];
+            __shared__ ValueType smCompactionValue2[taskThreads + 2];
+            __shared__ int smMaskCompaction[taskThreads + 2];
+            __shared__ char smCompactionChunkSelection[taskThreads + 2];
+            __shared__ char smCompactionChunkSelection2[taskThreads + 2];
+            
+            int childChunkOffsets[numChildNodesPerParent];
+            for (int j = 0; j < numChildNodesPerParent; j++)
+                childChunkOffsets[j] = 0;
+            for (int i = 0; i < numStrides; i++)
+            {
+                const int currentId = strideThreadId + i * chunkStride;
+                int newElementFound = 0;
+                KeyType key;
+                ValueType value;
+                if (currentId < totalWorkSize)
+                {
+                    key = keyIn[currentId + chunkOfs];
+                    value = valueIn[currentId + chunkOfs];
+                    newElementFound = (key >= chunkMin && key <= chunkMax);
+                }
+                char childChunkSelected = -1;
+                for (int j = 0; j < numChildNodesPerParent; j++)
+                {
+                    if (key >= childNodeRangeMin[j] && key <= childNodeRangeMax[j])
+                        childChunkSelected = j;
+                }
+                const int nCompacted = reducerInt.BlockSum(tid, newElementFound, smReductionInt);
+
+                char chunkSelectionCompacted;
+                KeyType keyCompacted;
+                ValueType valueCompacted;
+                compacter.BlockCompact2(
+                    key, value, 
+                    newElementFound, 
+                    smCompactionKey, smCompactionValue, 
+                    smCompactionKey2,smCompactionValue2,
+                    smMaskCompaction, 
+                    tid, 
+                    &keyCompacted, &valueCompacted, 
+                    smCompactionChunkSelection, smCompactionChunkSelection2, 
+                    childChunkSelected, &chunkSelectionCompacted);
+
+             
+                // calculate offsets of child chunks  from their sizes, within parent's region
+                int runningSum = 0;
+                // uses complete-tree definition to traverse tree without gaps. it has all children or none.
+                const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
+                for (int j = 0; j < numChildNodesPerParent; j++)
+                {
+                    // chunkId: zero based. tree-traversal: one based +1 -1
+                    const int childChunkIndex = childChunkIndexStart + j;
+                    // shared reduction
+                    const int sum = reducerInt.BlockSum(tid, newElementFound[j], smReductionInt);
+
+                    if (tid == 0)
+                    {
+                        // global reduction
+                        atomicAdd(&chunkLength[childChunkIndex], sum);
+
+                    }
+                    runningSum += chunkLength[childChunkIndex]; // todo: optimize this with shared memory or registers
+                }
+
+                // write values to out
+                for (int j = 0; j < numWrite; j++)
+                {
+
+                    keyOut[childOfs + chunkOfs + j];
+                }
 
             }
+
+
+
 
             /*
             const int chunkId = loadSingle(taskInChunkId, smLoadInt, tid);
@@ -353,22 +510,6 @@ namespace Sloth
             const KeyType chunkMax = loadSingle(chunkRangeMax + chunkId, smLoadInt, tid);
             */
 
-            
-            // uses complete-tree definition to traverse tree without gaps. it has all children or none.
-            const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
-            for (int j = 0; j < numChildNodesPerParent; j++)
-            {
-                // chunkId: zero based. tree-traversal: one based +1 -1
-                const int childChunkIndex = childChunkIndexStart + j;
-                const int sum = reducerInt.BlockSum(tid, newElementFound[j], smReductionInt);
-
-                if (tid == 0)
-                {
-                    
-                   atomicAdd(&chunkLength[childChunkIndex], sum);
-
-                }
-            }
         }
 
         __global__ void resetDebugBuffer(int * debugBuffer)
@@ -377,6 +518,7 @@ namespace Sloth
         }
   
     }
+
 
     template<typename KeyType, typename ValueType>
 	struct Tree
@@ -518,20 +660,25 @@ namespace Sloth
                     taskOutCounter->Data(),
                     debugBuffer->Data()
                 );
+
+
+                TreeInternalKernels::allocateChildChunkAndCopy <<<nTasks, TreeInternalKernels::taskThreads >>> (
+                    taskInCounter->Data(), taskInChunkId->Data(),
+                    chunkLength->Data(), chunkProgress->Data(), chunkNumTasks->Data(), chunkOffset->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data(),
+                    debugBuffer->Data()
+                    );
+
+
                 gpuErrchk(cudaDeviceSynchronize());
 
 
 #ifdef SLOTH_DEBUG_ENABLED
                 std::cout << "input range min: " << inputMinMax->Get(0) << std::endl;
                 std::cout << "input range max: " << inputMinMax->Get(1) << std::endl;
-                std::cout<<" total elements parsed: " << debugBuffer->Get(0) << std::endl;
-                int sum = 0;
-                for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
-                {
-                    sum += debugBuffer->Get(1 + i);
-                    std::cout << " child node " << i << ": " << debugBuffer->Get(1 + i)<<" == "<<debugBuffer->Get(1000+i) << "   (range " << debugBuffer->Get(100 + i * 2) << " - " << debugBuffer->Get(100 + i * 2 + 1) << ")" << std::endl;
-                }
-                std::cout << "sum: " << sum << std::endl;
+
                 std::cout << "-------------------------------" << std::endl;
 #endif
             }
