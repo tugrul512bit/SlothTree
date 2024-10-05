@@ -87,7 +87,7 @@ namespace Sloth
 		Type Get(const int id) const
 		{
 			Type result;
-			gpuErrchk(cudaMemcpy(&result, data, sizeof(Type), cudaMemcpyDeviceToHost));
+			gpuErrchk(cudaMemcpy(&result, data+id, sizeof(Type), cudaMemcpyDeviceToHost));
 			return result;
 		}
 
