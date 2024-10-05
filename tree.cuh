@@ -14,11 +14,11 @@ namespace Sloth
 
 
 
-        // each node of tree is handled by 1 block of threads
-        static constexpr int nodeThreads = 64;
-        static constexpr int nodeElements = 64;
+        // each task is computed by multiple blocks of threads
+        static constexpr int nodeThreads = 128;
+        static constexpr int nodeElements = 128;
         static constexpr int nodeMaxDepth = 20;
-        static constexpr int numChildNodesPerParent =2;
+        static constexpr int numChildNodesPerParent =8;
         static constexpr int numTaskParameters = 7 + 2 * numChildNodesPerParent; // offsets + atomic counters
 
 
@@ -841,127 +841,134 @@ namespace Sloth
         void Build(std::vector<KeyType>& keys, std::vector<ValueType>& values, bool debugEnabled = false)
         {
             const int inputSize = keys.size();
-            if (inputSize != values.size())
-            {
-                std::cout << "ERROR: keys size and values size are not equal." << std::endl;
-                return;
-            }
-            if (lastInputSize < inputSize)
-            {
-                // ping-pong buffers during building
-                treeKey = std::make_shared<Sloth::Buffer<KeyType>>("treeKey", 2 * inputSize, 0, false);
-                treeValue = std::make_shared<Sloth::Buffer<ValueType>>("treeValue", 2 * inputSize, 0, false);
-                inputKeyData = std::make_shared<Sloth::Buffer<KeyType>>("inputKeyData", inputSize, 0, false);
-                inputValueData = std::make_shared<Sloth::Buffer<ValueType>>("inputValueData", inputSize, 0, false);
-                lastInputSize = inputSize;
-            }
             std::vector<int> taskQueueHost(TreeInternalKernels::numTaskParameters + 1);
-
-
-            KeyType minMaxHost[2];
-            int treeHost[5] = { 0,0,0,0,0 };
-
-           
-
             int pingPongState = 0;
+            int treeHost[5] = { 0,0,0,0,0 };
             size_t t;
             {
                 Sloth::Bench bench(&t);
-
-
-
-                cudaMemcpy(inputKeyData->Data(), keys.data(), inputSize * sizeof(KeyType), cudaMemcpyHostToDevice);
-                cudaMemcpy(inputValueData->Data(), values.data(), inputSize * sizeof(ValueType), cudaMemcpyHostToDevice);
-                TreeInternalKernels::resetWork << <1, 1 >> > (work->Data());
-                TreeInternalKernels::minMaxReduction << <1 + (inputSize / TreeInternalKernels::nodeThreads) / 4, TreeInternalKernels::nodeThreads >> > (inputKeyData->Data(), work->Data(), inputSize, minMaxData->Data());
-                cudaDeviceSynchronize();
-                cudaMemcpy(minMaxHost, minMaxData->Data(), 2 * sizeof(KeyType), cudaMemcpyDeviceToHost);
-
-                for (int j = 0; j < 3; j++)
+                
+                if (inputSize != values.size())
                 {
-                    treeHost[j] = 0;
+                    std::cout << "ERROR: keys size and values size are not equal." << std::endl;
+                    return;
                 }
-                // range: [10,20]
-                treeHost[3] = minMaxHost[0];
-                treeHost[4] = minMaxHost[1];
-
-                // node offset, node depth, isinputinput,elementstartindex
-                taskQueueHost[0] = 1; // number of tasks given
-                // task 1
-                taskQueueHost[1] = TreeInternalKernels::nodeTreeHeader; // offset
-                taskQueueHost[2] = 0; // node depth
-                taskQueueHost[3] = 1; // its input is input array, not another node
-                taskQueueHost[4] = 0; // element starting index in tree's element buffer
-                taskQueueHost[5] = minMaxHost[0]; // range start
-                taskQueueHost[6] = minMaxHost[1]; // range stop
-                taskQueueHost[7] = inputSize; // number of elements to scan
-                for (int k = 0; k < TreeInternalKernels::numChildNodesPerParent * 2; k++)
-                    taskQueueHost[8 + k] = 0; // reset counts of (pseudo)allocation sizes per child nodes and their offsets
-                std::cout << "min:" << minMaxHost[0] << " max:" << minMaxHost[1] << std::endl;
-
-                cudaMemcpy(taskQueueGenerated->Data(), taskQueueHost.data(), (1 + TreeInternalKernels::numTaskParameters) * sizeof(int), cudaMemcpyHostToDevice);
-                cudaMemcpy(tree->Data(), treeHost, 5 * sizeof(int), cudaMemcpyHostToDevice);
-                int numTasks = 1;
-
-
-                cudaDeviceProp prop;
-                cudaGetDeviceProperties(&prop, 0);
-                int taskComputeResource = 1;
-
-
-                // 1 means copying from left to right
-                // 0 means copying from right to left (also initial run uses input arrays and writes to left)
-                pingPongState = 0;
-                int maxDebug = 100;
-                while (numTasks > 0)
+                if (lastInputSize < inputSize)
                 {
-                    if (maxDebug-- < 0)
-                        break;
-                    taskComputeResource = prop.multiProcessorCount / numTasks;
-                    if (taskComputeResource < 1)
-                        taskComputeResource = 1;
-
-                    TreeInternalKernels::applyGeneratedTaskQueueAndReset << <1, 1024 >> > (taskQueueUsed->Data(), taskQueueGenerated->Data());
-                    TreeInternalKernels::resetAllocation << <1, 1 >> > (tree->Data());
-
-
-                    // counts number of elements per child node
-                    TreeInternalKernels::buildTreeCountKeys << <taskComputeResource * numTasks, TreeInternalKernels::nodeThreads >> > (tree->Data(), inputKeyData->Data(), inputValueData->Data(),
-                        treeKey->Data(), treeValue->Data(), allocSize, TreeInternalKernels::nodeMaxDepth, taskQueueUsed->Data(), taskQueueGenerated->Data(),
-                        taskComputeResource);
-
-                    // allocates space from atomic counter so that next kernel knows where to copy data
-                    TreeInternalKernels::buildTreeAllocateSpace << <numTasks, 1 >> > (tree->Data(), inputKeyData->Data(), inputValueData->Data(),
-                        treeKey->Data(), treeValue->Data(), allocSize, TreeInternalKernels::nodeMaxDepth, taskQueueUsed->Data(), taskQueueGenerated->Data(),
-                        1);
-
-                    TreeInternalKernels::buildTreeDistributeElements << <taskComputeResource * 8 * numTasks, TreeInternalKernels::nodeThreads >> > (tree->Data(), inputKeyData->Data(), inputValueData->Data(),
-                        treeKey->Data(), treeValue->Data(), allocSize, TreeInternalKernels::nodeMaxDepth, taskQueueUsed->Data(), taskQueueGenerated->Data(),
-                        taskComputeResource * 8, pingPongState, inputSize);
-
-                    TreeInternalKernels::buildTreeCreateTasks << <1 * numTasks, TreeInternalKernels::nodeThreads >> > (tree->Data(), inputKeyData->Data(), inputValueData->Data(),
-                        treeKey->Data(), treeValue->Data(), allocSize, TreeInternalKernels::nodeMaxDepth, taskQueueUsed->Data(), taskQueueGenerated->Data(),
-                        1, pingPongState, inputSize);
+                    // ping-pong buffers during building
+                    treeKey = std::make_shared<Sloth::Buffer<KeyType>>("treeKey", 2 * inputSize, 0, false);
+                    treeValue = std::make_shared<Sloth::Buffer<ValueType>>("treeValue", 2 * inputSize, 0, false);
+                    inputKeyData = std::make_shared<Sloth::Buffer<KeyType>>("inputKeyData", inputSize, 0, false);
+                    inputValueData = std::make_shared<Sloth::Buffer<ValueType>>("inputValueData", inputSize, 0, false);
+                    lastInputSize = inputSize;
+                }
 
 
-                    //debug1 << <1, 1 >> > (taskQueueGenerated.Data());
+
+                KeyType minMaxHost[2];
+                
+
+
+
+                
+                
+                {
+
+
+
+
+                    cudaMemcpy(inputKeyData->Data(), keys.data(), inputSize * sizeof(KeyType), cudaMemcpyHostToDevice);
+                    cudaMemcpy(inputValueData->Data(), values.data(), inputSize * sizeof(ValueType), cudaMemcpyHostToDevice);
+                    TreeInternalKernels::resetWork << <1, 1 >> > (work->Data());
+                    TreeInternalKernels::minMaxReduction << <1 + (inputSize / TreeInternalKernels::nodeThreads) / 4, TreeInternalKernels::nodeThreads >> > (inputKeyData->Data(), work->Data(), inputSize, minMaxData->Data());
                     cudaDeviceSynchronize();
-                    pingPongState = 1 - pingPongState;
+                    cudaMemcpy(minMaxHost, minMaxData->Data(), 2 * sizeof(KeyType), cudaMemcpyDeviceToHost);
 
-                    cudaMemcpy(taskQueueHost.data(), taskQueueGenerated->Data(), (1 + TreeInternalKernels::numTaskParameters) * sizeof(int), cudaMemcpyDeviceToHost);
-                    numTasks = taskQueueHost[0];
-                    if (debugEnabled)
+                    for (int j = 0; j < 3; j++)
                     {
-                        std::cout << "number of tasks = " << numTasks<< "    compute resource per task = "<< taskComputeResource << std::endl;
-                        
+                        treeHost[j] = 0;
                     }
-                    break;
+                    // range: [10,20]
+                    treeHost[3] = minMaxHost[0];
+                    treeHost[4] = minMaxHost[1];
+
+                    // node offset, node depth, isinputinput,elementstartindex
+                    taskQueueHost[0] = 1; // number of tasks given
+                    // task 1
+                    taskQueueHost[1] = TreeInternalKernels::nodeTreeHeader; // offset
+                    taskQueueHost[2] = 0; // node depth
+                    taskQueueHost[3] = 1; // its input is input array, not another node
+                    taskQueueHost[4] = 0; // element starting index in tree's element buffer
+                    taskQueueHost[5] = minMaxHost[0]; // range start
+                    taskQueueHost[6] = minMaxHost[1]; // range stop
+                    taskQueueHost[7] = inputSize; // number of elements to scan
+                    for (int k = 0; k < TreeInternalKernels::numChildNodesPerParent * 2; k++)
+                        taskQueueHost[8 + k] = 0; // reset counts of (pseudo)allocation sizes per child nodes and their offsets
+                    std::cout << "min:" << minMaxHost[0] << " max:" << minMaxHost[1] << std::endl;
+
+                    cudaMemcpy(taskQueueGenerated->Data(), taskQueueHost.data(), (1 + TreeInternalKernels::numTaskParameters) * sizeof(int), cudaMemcpyHostToDevice);
+                    cudaMemcpy(tree->Data(), treeHost, 5 * sizeof(int), cudaMemcpyHostToDevice);
+                    int numTasks = 1;
+
+
+                    cudaDeviceProp prop;
+                    cudaGetDeviceProperties(&prop, 0);
+                    int taskComputeResource = 1;
+
+
+                    // 1 means copying from left to right
+                    // 0 means copying from right to left (also initial run uses input arrays and writes to left)
+                    pingPongState = 0;
+                    int maxDebug = 100;
+                    while (numTasks > 0)
+                    {
+                        if (maxDebug-- < 0)
+                            break;
+                        taskComputeResource = prop.multiProcessorCount / numTasks;
+                        if (taskComputeResource < 1)
+                            taskComputeResource = 1;
+
+                        TreeInternalKernels::applyGeneratedTaskQueueAndReset << <1, 1024 >> > (taskQueueUsed->Data(), taskQueueGenerated->Data());
+                        TreeInternalKernels::resetAllocation << <1, 1 >> > (tree->Data());
+
+
+                        // counts number of elements per child node
+                        TreeInternalKernels::buildTreeCountKeys << <taskComputeResource * numTasks, TreeInternalKernels::nodeThreads >> > (tree->Data(), inputKeyData->Data(), inputValueData->Data(),
+                            treeKey->Data(), treeValue->Data(), allocSize, TreeInternalKernels::nodeMaxDepth, taskQueueUsed->Data(), taskQueueGenerated->Data(),
+                            taskComputeResource);
+
+                        // allocates space from atomic counter so that next kernel knows where to copy data
+                        TreeInternalKernels::buildTreeAllocateSpace << <numTasks, 1 >> > (tree->Data(), inputKeyData->Data(), inputValueData->Data(),
+                            treeKey->Data(), treeValue->Data(), allocSize, TreeInternalKernels::nodeMaxDepth, taskQueueUsed->Data(), taskQueueGenerated->Data(),
+                            1);
+
+                        TreeInternalKernels::buildTreeDistributeElements << <taskComputeResource * 8 * numTasks, TreeInternalKernels::nodeThreads >> > (tree->Data(), inputKeyData->Data(), inputValueData->Data(),
+                            treeKey->Data(), treeValue->Data(), allocSize, TreeInternalKernels::nodeMaxDepth, taskQueueUsed->Data(), taskQueueGenerated->Data(),
+                            taskComputeResource * 8, pingPongState, inputSize);
+
+                        TreeInternalKernels::buildTreeCreateTasks << <1 * numTasks, TreeInternalKernels::nodeThreads >> > (tree->Data(), inputKeyData->Data(), inputValueData->Data(),
+                            treeKey->Data(), treeValue->Data(), allocSize, TreeInternalKernels::nodeMaxDepth, taskQueueUsed->Data(), taskQueueGenerated->Data(),
+                            1, pingPongState, inputSize);
+
+
+                        //debug1 << <1, 1 >> > (taskQueueGenerated.Data());
+                        cudaDeviceSynchronize();
+                        pingPongState = 1 - pingPongState;
+
+                        cudaMemcpy(taskQueueHost.data(), taskQueueGenerated->Data(), (1 + TreeInternalKernels::numTaskParameters) * sizeof(int), cudaMemcpyDeviceToHost);
+                        numTasks = taskQueueHost[0];
+                        if (debugEnabled)
+                        {
+                            std::cout << "number of tasks = " << numTasks << "    compute resource per task = " << taskComputeResource << std::endl;
+
+                        }
+                        break;
+                    }
+
+
+
                 }
-               
-
-
             }
-
             std::cout << "gpu: " << t / 1000000000.0 << "s" << std::endl;
 
             if (debugEnabled)
@@ -1004,17 +1011,21 @@ namespace Sloth
                     std::cout << "errctr = " << errCtr << std::endl;
                     exit(0);
                 }
+
+
+                size_t t;
+                {
+                    Sloth::Bench bench(&t);
+                    std::unordered_map<KeyType, ValueType> map;
+                    for (int j = 0; j < inputSize; j++)
+                    {
+                        map[keys[j]] = j;
+                    }
+                }
+                std::cout << "cpu: " << t / 1000000000.0 << "s" << std::endl;
             }
 
-            {
-                Sloth::Bench bench(&t);
-                std::unordered_map<KeyType, ValueType> map;
-                for (int j = 0; j < inputSize; j++)
-                {
-                    map[keys[j]] = j;
-                }
-            }
-            std::cout << "cpu: " << t / 1000000000.0 << "s" << std::endl;
+
         }
 
 		~Tree()
