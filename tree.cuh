@@ -315,7 +315,7 @@ namespace Sloth
         __global__ void resetChunkLength(
             int* taskInCounter, int* taskInChunkId,
             int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
-            KeyType* chunkRangeMin, KeyType* chunkRangeMax, int* chunkCounter,
+            KeyType* chunkRangeMin, KeyType* chunkRangeMax, int* chunkCounter,char * chunkType,
             KeyType* keyIn, ValueType* valueIn, KeyType* keyOut, ValueType* valueOut,
             int* taskOutCounter,
             int* debugBuffer
@@ -339,26 +339,20 @@ namespace Sloth
             const int chunkChildRange = ((double)chunkMax - (double)chunkMin) / numChildNodesPerParent;
 
 
-
-            // if ranges are too small or if it is a leaf-node, do not create child nodes
-            if ((chunkChildRange < 1) || (totalWorkSize <= taskThreads))
-                return;
-
-
             // chunk is processed in multiple leaps of this stride 
             const int chunkStride = taskThreads * chunkTasks;
             const int strideThreadId = tid + (bid % chunkTasks) * bs; // this allows variable amount of tasks per chunk within same kernel
             const int numStrides = 1 + (totalWorkSize - 1) / chunkStride;
 
             const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
-            for (int j = 0; j < numChildNodesPerParent; j++)
+            // if a chunk is being processed, it is at least a node (value of 2 means leaf node)
+            if (strideThreadId == 0)
             {
-
-                const int childChunkIndex = childChunkIndexStart + j;
- 
-                if (strideThreadId == 0)
+                chunkType[chunkId] = 1;
+                for (int j = 0; j < numChildNodesPerParent; j++)
                 {
-                    chunkLength[childChunkIndex] = 0;
+                    const int childChunkIndex = childChunkIndexStart + j;
+                    chunkLength[childChunkIndex] = 0; 
                 }
             }
         }
@@ -372,7 +366,7 @@ namespace Sloth
         __global__ void computeChildChunkAllocationRequirements(
             int * taskInCounter, int * taskInChunkId,
             int * chunkLength, int * chunkProgress, int * chunkNumTasks, int * chunkOffset,
-            KeyType * chunkRangeMin, KeyType * chunkRangeMax, int* chunkCounter,
+            KeyType * chunkRangeMin, KeyType * chunkRangeMax, int* chunkCounter, char* chunkType,
             KeyType * keyIn, ValueType * valueIn, KeyType * keyOut, ValueType * valueOut,
             int * taskOutCounter,
             int * debugBuffer
@@ -474,7 +468,7 @@ namespace Sloth
         __global__ void computeChildChunkOffset(
             int* taskInCounter, int* taskInChunkId,
             int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
-            KeyType* chunkRangeMin, KeyType* chunkRangeMax,
+            KeyType* chunkRangeMin, KeyType* chunkRangeMax, int * chunkCounter , char* chunkType,
             KeyType* keyIn, ValueType* valueIn, KeyType* keyOut, ValueType* valueOut,
             int* taskOutCounter,
             int* debugBuffer
@@ -525,7 +519,7 @@ namespace Sloth
         __global__ void allocateChildChunkAndCopy(
             int* taskInCounter, int* taskInChunkId,
             int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
-            KeyType* chunkRangeMin, KeyType* chunkRangeMax, int * chunkCounter,
+            KeyType* chunkRangeMin, KeyType* chunkRangeMax, int * chunkCounter, char * chunkType,
             KeyType* keyIn, ValueType* valueIn, KeyType* keyOut, ValueType* valueOut,
             int* taskOutCounter,
             int* debugBuffer
@@ -549,7 +543,7 @@ namespace Sloth
             const int chunkChildRange = ((double)chunkMax - (double)chunkMin) / numChildNodesPerParent;
 
 
-
+            
             // if ranges are too small or if it is a leaf-node, do not create child nodes
             if ((chunkChildRange < 1) || (totalWorkSize <= taskThreads))
                 return;
@@ -652,11 +646,14 @@ namespace Sloth
                     }
                 }
 
-                
-
+               
             }
 
-
+            // if made it this far, it is a node with children
+            if (strideThreadId == 0)
+            {
+                chunkType[chunkId] = 2;
+            }
 
         }
 
@@ -685,9 +682,9 @@ namespace Sloth
         std::shared_ptr<Sloth::Buffer<int>> taskOutCounter;
         std::shared_ptr<Sloth::Buffer<int>> taskOutChunkId;
 
-        // 0: empty, 1: node, 2: leaf
+        // 0: empty, 1: leaf node, 2: node with children
         std::shared_ptr<Sloth::Buffer<char>> chunkType;
-
+        std::shared_ptr<Sloth::Buffer<char>> chunkDepth; // can't have more than 127 depth in any case
         std::shared_ptr<Sloth::Buffer<int>> chunkCounter;
         std::shared_ptr<Sloth::Buffer<int>> chunkNumTasks;
         std::shared_ptr<Sloth::Buffer<int>> chunkOffset;
@@ -730,7 +727,8 @@ namespace Sloth
             taskInChunkId = std::make_shared< Sloth::Buffer<int>>("taskInChunkId", maxTasks, 0, false);
             taskOutChunkId = std::make_shared< Sloth::Buffer<int>>("taskOutChunkId", maxTasks, 0, false);
 
-            chunkType = std::make_shared< Sloth::Buffer<char>>("chunkType", maxChunks, 0, false);
+            chunkType = std::make_shared< Sloth::Buffer<char>>("chunkType", maxChunks, 0, false);            
+            chunkDepth = std::make_shared< Sloth::Buffer<char>>("chunkDepth", maxChunks, 0, false);
             chunkCounter = std::make_shared< Sloth::Buffer<int>>("chunkCounter", maxChunks, 0, false);
             chunkNumTasks = std::make_shared< Sloth::Buffer<int>>("chunkNumTasks", maxChunks, 0, false);
             chunkOffset = std::make_shared< Sloth::Buffer<int>>("chunkOffset", maxChunks, 0, false);
@@ -809,7 +807,7 @@ namespace Sloth
                 TreeInternalKernels::resetChunkLength <<<nTasks, TreeInternalKernels::taskThreads>>> (
                     taskInCounter->Data(), taskInChunkId->Data(),
                     chunkLength->Data(), chunkProgress->Data(), chunkNumTasks->Data(), chunkOffset->Data(),
-                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(),chunkType->Data(),
                     keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
                     taskOutCounter->Data(),
                     debugBuffer->Data()
@@ -817,7 +815,7 @@ namespace Sloth
                 TreeInternalKernels::computeChildChunkAllocationRequirements <<<nTasks, TreeInternalKernels::taskThreads>>>(
                     taskInCounter->Data(), taskInChunkId->Data(),
                     chunkLength->Data(), chunkProgress->Data(),chunkNumTasks->Data(),chunkOffset->Data(),
-                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(),chunkType->Data(),
                     keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
                     taskOutCounter->Data(),
                     debugBuffer->Data()
@@ -826,7 +824,7 @@ namespace Sloth
                 TreeInternalKernels::computeChildChunkOffset << <nTasks, TreeInternalKernels::taskThreads >> > (
                     taskInCounter->Data(), taskInChunkId->Data(),
                     chunkLength->Data(), chunkProgress->Data(), chunkNumTasks->Data(), chunkOffset->Data(),
-                    chunkRangeMin->Data(), chunkRangeMax->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
                     keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
                     taskOutCounter->Data(),
                     debugBuffer->Data()
@@ -835,7 +833,7 @@ namespace Sloth
                 TreeInternalKernels::allocateChildChunkAndCopy <<<nTasks, TreeInternalKernels::taskThreads >>> (
                     taskInCounter->Data(), taskInChunkId->Data(),
                     chunkLength->Data(), chunkProgress->Data(), chunkNumTasks->Data(), chunkOffset->Data(),
-                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
                     keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
                     taskOutCounter->Data(),
                     debugBuffer->Data()
