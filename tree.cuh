@@ -6,6 +6,8 @@
 #include<unordered_map>
 namespace Sloth
 {
+#define SLOTH_DEBUG_ENABLED
+
     namespace TreeInternalKernels
     {
 
@@ -18,8 +20,8 @@ namespace Sloth
         // each chunk can have multiple tasks
         static constexpr int taskThreads = 1024;
         static constexpr int nodeElements = 1024;
-        static constexpr int nodeMaxDepth = 10;
-        static constexpr int numChildNodesPerParent =4;
+        static constexpr int nodeMaxDepth = 5;
+        static constexpr int numChildNodesPerParent =32;
         
        
 
@@ -253,13 +255,12 @@ namespace Sloth
 
 
 
-        /* separate array into numChildNodesPerParent chunks (maximum 64 chunks)
-         each chunk has a different range of values:
-         chunk 1      chunk 2         chunk 3
-         a      b     b+1   c         c+1   d
+        /* 
+            creates node from current task group
+            counts children nodes elements if necessary
         */ 
         template<typename KeyType, typename ValueType>
-        __global__ void createChunks(
+        __global__ void computeChildChunkAllocationRequirements(
             int * taskInCounter, int * taskInChunkId,
             int * chunkLength, int * chunkProgress, int * chunkNumTasks, int * chunkOffset,
             KeyType * chunkRangeMin, KeyType * chunkRangeMax,
@@ -284,6 +285,13 @@ namespace Sloth
             // if parent range is [0,640] and if there are 64 children per node, then each child will have 10 sized range, [0,9],[10,19],...
             const int chunkChildRange = ((double)chunkMax - (double)chunkMin) / numChildNodesPerParent;
 
+
+            
+            // if ranges are too small or if it is a leaf-node, do not create child nodes
+            if ((chunkChildRange < 1) || (totalWorkSize <= taskThreads))
+                return;
+
+
             // chunk is processed in multiple leaps of this stride 
             const int chunkStride = taskThreads * chunkTasks;
             const int strideThreadId = tid + (bid % chunkTasks)*bs; // this allows variable amount of tasks per chunk within same kernel
@@ -303,13 +311,22 @@ namespace Sloth
                     curEnd = chunkMax;
                 childNodeRangeMin[i] = curBegin;
                 childNodeRangeMax[i] = curEnd;
+#ifdef SLOTH_DEBUG_ENABLED
                 if (strideThreadId == 0)
                 {
                     debugBuffer[100 + i * 2] = curBegin;
                     debugBuffer[100 + i * 2 + 1] = curEnd;
                 }
+#endif
                 curBegin = curEnd + 1;
             }
+
+            __shared__ char smChildNodeSelectionCompaction[taskThreads];
+            __shared__ KeyType smKeyCompaction[taskThreads];
+            __shared__ ValueType smValueCompaction[taskThreads];
+            int newElementFound[numChildNodesPerParent];
+            for (int j = 0; j < numChildNodesPerParent; j++)
+                newElementFound[j] = 0;
 
             for (int i = 0; i < numStrides; i++)
             {
@@ -318,17 +335,28 @@ namespace Sloth
                 if (currentId < totalWorkSize)
                 {
                     key = keyIn[currentId + chunkOfs];
-                    atomicAdd(&debugBuffer[0], 1);
 
+#ifdef SLOTH_DEBUG_ENABLED
+                    atomicAdd(&debugBuffer[0], 1);
+#endif
                     for (int j = 0; j < numChildNodesPerParent; j++)
                     {
                         if (key >= childNodeRangeMin[j] && key <= childNodeRangeMax[j])
                         {
-                            atomicAdd(&debugBuffer[1+j], 1);
+                            newElementFound[j] = 1;
 
+#ifdef SLOTH_DEBUG_ENABLED
+                            atomicAdd(&debugBuffer[1+j], 1);
+#endif
                         }
                     }
                 }
+
+
+
+                // num_child times
+                // reduction 
+                // stream compaction
             }
 
 
@@ -349,7 +377,8 @@ namespace Sloth
         // 1 task = 1 block of threads
         // all in same kernel
         // 1 chunk = N tasks when N tasks have same id
-
+        // chunk = tree node
+        // keyin/out valuein/out are elements
         std::shared_ptr<Sloth::Buffer<int>> taskInCounter;
         std::shared_ptr<Sloth::Buffer<int>> taskInChunkId;
 
@@ -409,18 +438,25 @@ namespace Sloth
 
 		}
 
-        void Build(std::vector<KeyType>& keys, std::vector<ValueType>& values, bool debugEnabled = false)
+        void Build(std::vector<KeyType>& keys, std::vector<ValueType>& values)
         {
             const int inputSize = keys.size();
-            if (debugEnabled)
+#ifdef SLOTH_DEBUG_ENABLED
+      
+            if (debugBufferSize == 0)
             {
-                if (debugBufferSize == 0)
-                {
-                    debugBufferSize = 1024 * 1024 * 100;
-                    debugBuffer = std::make_shared< Sloth::Buffer<int>>("debugBuffer", debugBufferSize, 0, false);
-                }
-                TreeInternalKernels::resetDebugBuffer << <debugBufferSize / 1024, 1024 >> > (debugBuffer->Data());
+                debugBufferSize = 1024 * 1024 * 100;
+                debugBuffer = std::make_shared< Sloth::Buffer<int>>("debugBuffer", debugBufferSize, 0, false);
             }
+            TreeInternalKernels::resetDebugBuffer << <debugBufferSize / 1024, 1024 >> > (debugBuffer->Data());
+            cudaDeviceSynchronize();
+#else
+            if (debugBufferSize == 0)
+            {
+                debugBuffer = std::make_shared< Sloth::Buffer<int>>("debugBuffer", 1, 0, false);
+                debugBufferSize = 1;
+            }
+#endif
             size_t t;
             {
                 Sloth::Bench bench(&t);
@@ -464,7 +500,8 @@ namespace Sloth
                 taskInChunkId->CopyFrom(tasks.data(),nTasks);
                 
                 taskOutCounter->Set(0, 0);
-                TreeInternalKernels::createChunks<<<nTasks, TreeInternalKernels::taskThreads>>>(
+                
+                TreeInternalKernels::computeChildChunkAllocationRequirements <<<nTasks, TreeInternalKernels::taskThreads>>>(
                     taskInCounter->Data(), taskInChunkId->Data(),
                     chunkLength->Data(), chunkProgress->Data(),chunkNumTasks->Data(),chunkOffset->Data(),
                     chunkRangeMin->Data(), chunkRangeMax->Data(),
@@ -475,16 +512,19 @@ namespace Sloth
                 gpuErrchk(cudaDeviceSynchronize());
 
 
-                if (debugEnabled)
+#ifdef SLOTH_DEBUG_ENABLED
+                std::cout << "input range min: " << inputMinMax->Get(0) << std::endl;
+                std::cout << "input range max: " << inputMinMax->Get(1) << std::endl;
+                std::cout<<" total elements parsed: " << debugBuffer->Get(0) << std::endl;
+                int sum = 0;
+                for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
                 {
-
-                    std::cout << "input range min: " << inputMinMax->Get(0) << std::endl;
-                    std::cout << "input range max: " << inputMinMax->Get(1) << std::endl;
-                    std::cout<<" total elements parsed: " << debugBuffer->Get(0) << std::endl;
-                    for(int i=0;i<TreeInternalKernels::numChildNodesPerParent;i++)
-                        std::cout << " child node " << i << ": "<<debugBuffer->Get(1+i)<<"   (range "<<debugBuffer->Get(100+i*2)<<" - "<< debugBuffer->Get(100 + i * 2+1)<<")" << std::endl;
-                    std::cout << "-------------------------------" << std::endl;
+                    sum += debugBuffer->Get(1 + i);
+                    std::cout << " child node " << i << ": " << debugBuffer->Get(1 + i) << "   (range " << debugBuffer->Get(100 + i * 2) << " - " << debugBuffer->Get(100 + i * 2 + 1) << ")" << std::endl;
                 }
+                std::cout << "sum: " << sum << std::endl;
+                std::cout << "-------------------------------" << std::endl;
+#endif
             }
             std::cout << "gpu: " << t / 1000000000.0 << "s" << std::endl;
 
