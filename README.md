@@ -104,3 +104,11 @@ cpu: 0.0812151s
 - Tree of 1 million elements take roughly 2 milliseconds on a RTX4070 with 5888 CUDA pipelines while inserting same data to an std::unordered_map takes 70-90 milliseconds on a Ryzen7900 core. Despite having 40% warp occupancy and 50% of maximum in-flight warps, GPU is nearly 40 times faster to build a tree. 
 
 ![Top-down approach](https://github.com/tugrul512bit/SlothTree/blob/master/sloth-tree.drawio.png)
+
+# Separating Chunks
+
+- Allocating chunks requires counting the number of elements. This is computed with parallel reduction in shared memory and warp shuffle. From 128 elements to 32 elements, shared memory is used. From 32 elements to 1 element, warp shuffle is used.
+- Moving millions of elements to their target with only atomics-based offset computation is slow. Due to this, multiple elements are extracted from 128-sized regions by parallel stream-compaction.
+- This is repeated for each child node chunk
+
+![counting & compacting](https://github.com/tugrul512bit/SlothTree/blob/master/separating-chunks.drawio.png)
