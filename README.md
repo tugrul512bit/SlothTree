@@ -15,40 +15,53 @@ Sloths win.
 
 Building tree:
 
-Up to 40x faster than std::unordered_map for inserting same number of random elements.
+Up to 30x faster than std::unordered_map for inserting same number of random elements.
 
-Finding element:
+Finding element (under development):
 
-Up to 3000x faster than brute-force scanning array. Under development.
+Up to 30x faster than std::unortered_map for finding multiple keys and 3000x faster than brute-force scanning array. 
+
+Todo: optimize leaf nodes with sorting & binary-search.
+
 
 Sample benchmark code:
 ```C++
 #include"tree.cuh"
-
+#include<random>
 int main()
 {
+    // searching nSearch items in an array of n elements
+    int n = 10000000;
+    const int nSearch = 10000000;
 
-    int n = 1000000;
     Sloth::Tree<int, int> tree;
     std::unordered_map<int, int> map;
     std::vector<int> key(n);
     std::vector<int> value(n);
     for (int i = 0; i < n; i++)
     {
-        key[i] =  rand()*rand()+rand();
+        key[i] = i;
         value[i] = i;
     }
+    unsigned int seed = 0;
 
+    // unique random numbers generated
+    std::shuffle(key.begin(), key.end(), std::default_random_engine(seed));
+
+    std::cout << " =========================== Benchmarking Initialization ============================ " << std::endl;
     // build tests
     for (int i = 0; i < 5; i++)
     {
+        size_t t;
         std::cout << "------------------------------------------------------------------------------------" << std::endl;
         int valueFound = -1;
         bool found = false;
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 100; i++)
         {
-            tree.Build(key, value);
-            
+            {
+                Sloth::Bench bench(&t);
+                tree.Build(key, value);
+            }
             valueFound = -1;
             found |= tree.FindKeyCpu(key[15], valueFound);
             if (valueFound == -1)
@@ -65,79 +78,82 @@ int main()
                     std::cout << "error: tree traversal could not find the key that was inserted." << std::endl;
                     return 0;
                 }
-                
+
                 std::cout << "Find-failure!" << std::endl;
-                std::cout << " found: " << (found?"yes":"no")<<std::endl;
+                std::cout << " found: " << (found ? "yes" : "no") << std::endl;
                 std::cout << " found value: " << valueFound << " real value: " << value[15] << std::endl;
                 std::cout << "error: tree traversal could not find the key that was inserted." << std::endl;
                 return 0;
             }
+            if(i%10 == 0)
+                std::cout << "build gpu: " << t / 1000000000.0 << "s" << std::endl;
         }
         std::cout << " found: " << (found ? "yes" : "no") << std::endl;
         std::cout << " found value: " << valueFound << " real value: " << value[15] << std::endl;
         map.clear();
-        size_t t;
+        
         {
             Sloth::Bench bench(&t);
             for (int j = 0; j < n; j++)
                 map[key[j]] = value[j];
         }
-        std::cout << "build cpu: " << t / 1000000000.0 << "s" << std::endl;
+        std::cout << "build std::unordered_map: " << t / 1000000000.0 << "s" << std::endl;
 
     }
 
 
-    std::cout << "1x brute-force cpu find: " << std::endl;
+    std::cout << " =========================== Benchmarking Search Operation ============================ " << std::endl;
 
 
     // search tests
     // nSearch consumes too much video-memory. beware.
     // it allocates enough queue-space for nSearch CUDA threads
     // if 1 million keys are to be searched, do it in 100 steps using 10k chunks
-    const int nSearch = 10000;
+
     std::vector<int> keys(nSearch);
     std::vector<int> values(nSearch);
     std::vector<char> conditions(nSearch);
     std::vector<int> valuesBruteForce(nSearch);
     std::vector<char> conditionsBruteForce(nSearch);
     for (int i = 0; i < nSearch; i++)
-    {
-        keys[i] = rand() * rand() + rand();        
+    {        
+        keys[i] = i;
     }
+    // searching doesn't require unique keys but same code was reused anyway.
+    std::shuffle(key.begin(), key.end(), std::default_random_engine(seed));
 
-
-    for (int j = 0; j < 3; j++)
+    size_t t;
+    for (int i = 0; i < 5; i++)
     {
-        size_t t;
         {
             Sloth::Bench bench(&t);
             for (int j = 0; j < nSearch; j++)
             {
                 bool cond = false;
                 int val = -1;
-                for (int i = 0; i < n; i++)
+                auto it = map.find(keys[j]);
+                if (it != map.end())
                 {
-                    if (keys[j] == key[i])
-                    {
-                        cond = true;
-                        val = value[i];
-                        break;
-                    }
+                    val = it->second;
+                    cond = true;
                 }
                 conditionsBruteForce[j] = cond;
                 valuesBruteForce[j] = val;
             }
-        }
 
-        std::cout << "brute force find cpu: " << t / 1000000000.0 << "s" << std::endl;
-        for (int i = 0; i < 15; i++)
+        }
+        std::cout << "find std::unordered_map: " << t / 1000000000.0 << "s" << std::endl;
+
+        for (int k = 0; k < 100; k++)
         {
             {
                 Sloth::Bench bench(&t);
                 tree.FindKeyGpu(keys, values, conditions);
             }
-            std::cout << "simple find gpu: " << t / 1000000000.0 << "s" << std::endl;
+            if(k%10==0)
+                std::cout << "simple find gpu: " << t / 1000000000.0 << "s" << std::endl;
         }
+
         //checking error
         for (int i = 0; i < nSearch; i++)
         {
@@ -156,11 +172,12 @@ int main()
             if (fail)
             {
                 std::cout << "tree result: " << values[i] << " brute-force result: " << valuesBruteForce[i] << std::endl;
-                std::cout << "tree condition: " << (int) conditions[i] << " brute-force condition: " <<  (int)conditionsBruteForce[i] << std::endl;
+                std::cout << "tree condition: " << (int)conditions[i] << " brute-force condition: " << (int)conditionsBruteForce[i] << std::endl;
                 return 0;
             }
         }
     }
+
     return 0;
 }
 
@@ -168,46 +185,58 @@ int main()
 
 Output:
 ```
+ =========================== Benchmarking Initialization ============================
 ------------------------------------------------------------------------------------
-build gpu: 0.0078295s
-build gpu: 0.0025396s
-build gpu: 0.0024831s
-build gpu: 0.0024197s
-build gpu: 0.0024611s
+build gpu: 0.0416458s
+build gpu: 0.0302957s
+build gpu: 0.0302053s
+build gpu: 0.0301851s
+build gpu: 0.0301825s
+build gpu: 0.0301958s
+build gpu: 0.0301058s
+build gpu: 0.0302575s
+build gpu: 0.0302568s
+build gpu: 0.0301617s
  found: yes
  found value: 15 real value: 15
-build cpu: 0.158406s
-
+build std::unordered_map: 2.35114s
 ------------------------------------------------------------------------------------
-build gpu: 0.0026996s
-build gpu: 0.0025182s
-build gpu: 0.0024496s
-build gpu: 0.0024429s
-build gpu: 0.0024122s
+build gpu: 0.0312252s
+build gpu: 0.0302512s
+build gpu: 0.0303013s
+build gpu: 0.0302175s
+build gpu: 0.0303988s
+build gpu: 0.0302662s
+build gpu: 0.0303072s
+build gpu: 0.0302863s
+build gpu: 0.0302872s
+build gpu: 0.0304177s
  found: yes
  found value: 15 real value: 15
-build cpu: 0.0748112s
-------------------------------------------------------------------------------------
-brute force find cpu: 1.84401s
-simple find gpu: 0.0561698s
-simple find gpu: 0.0006346s
-simple find gpu: 0.0006137s
-simple find gpu: 0.0006114s
-simple find gpu: 0.0006114s
-simple find gpu: 0.0006114s
-simple find gpu: 0.0006109s
-simple find gpu: 0.0006105s
-simple find gpu: 0.0006329s
-simple find gpu: 0.0006256s
-simple find gpu: 0.0006126s
-simple find gpu: 0.0006103s
-simple find gpu: 0.0006665s
-simple find gpu: 0.0006237s
-simple find gpu: 0.0006121s
-brute force find cpu: 1.85026s
-simple find gpu: 0.0006857s
-simple find gpu: 0.0006161s
-simple find gpu: 0.0006146s
+build std::unordered_map: 1.11404s
+ =========================== Benchmarking Search Operation ============================
+find std::unordered_map: 0.281693s
+simple find gpu: 0.0574773s
+simple find gpu: 0.0125695s
+simple find gpu: 0.0110345s
+simple find gpu: 0.0110986s
+simple find gpu: 0.0111087s
+simple find gpu: 0.0111835s
+simple find gpu: 0.0110757s
+simple find gpu: 0.0110935s
+simple find gpu: 0.0111551s
+simple find gpu: 0.0128292s
+find std::unordered_map: 0.301685s
+simple find gpu: 0.0114173s
+simple find gpu: 0.0110771s
+simple find gpu: 0.0111175s
+simple find gpu: 0.0111261s
+simple find gpu: 0.0111066s
+simple find gpu: 0.0110424s
+simple find gpu: 0.0130347s
+simple find gpu: 0.0149974s
+simple find gpu: 0.0110752s
+simple find gpu: 0.0110937s
 ```
 
 # Building a Tree With CUDA
@@ -223,8 +252,7 @@ simple find gpu: 0.0006146s
 - Phase 4: tasks generate new tasks depending on node depth level, number of elements inside node and size of child node ranges
 - Phase 5: book-keeping variables are resetted and loops to phase 1 until there are no tasks generated
 - All allocations are only computed on a preallocated array by using atomicAdd on an offset variable.
-- All objects are in form of struct-of-arrays because SOA is more efficient to read/write in parallel than AOS. When a field is required, only that information is accessed and memory bank conflicts, serializations are minimized.
-- Tree of 1 million elements take roughly 2 milliseconds on a RTX4070 with 5888 CUDA pipelines while inserting same data to an std::unordered_map takes 70-90 milliseconds on a Ryzen7900 core. Despite having 40% warp occupancy and 50% of maximum in-flight warps, GPU is nearly 40 times faster to build a tree. 
+- All objects are in form of struct-of-arrays because SOA is more efficient to read/write in parallel than AOS. When a field is required, only that information is accessed and memory bank conflicts, serializations are minimized. 
 
 ![Top-down approach](https://github.com/tugrul512bit/SlothTree/blob/master/sloth-tree.drawio.png)
 
