@@ -1,6 +1,6 @@
 # SlothTree
 
-If a Ryzen CPU core is a strong bear, then a single CUDA pipeline a lazy sloth. If both are racing to get apples from a tree, 1 at a time, the bear always wins by a large margin:
+If a Ryzen CPU core is a bear, then a single CUDA pipeline is a sloth. If both compete to get apple from a tree, 1 at a time, the bear always wins by a large margin:
 
 - bear: 1 apple per 15 seconds --> 240 apples per hour
 - sloth: 1 apple per hour
