@@ -11,6 +11,8 @@ But, when we have a lot of sloths:
 
 Sloths win.
 
+---
+
 Building tree:
 
 Up to 40x faster than std::unordered_map for inserting same number of random elements.
