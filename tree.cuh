@@ -842,21 +842,23 @@ namespace Sloth
             // create tasks for children
             if (strideThreadId == 0)
             {
-                const int newTaskIdOfs = atomicAdd(&taskOutCounter[0], numChildNodesPerParent);
+                const int nextParallelism = ((chunkTasks / numChildNodesPerParent > 0) ? (chunkTasks / numChildNodesPerParent) : 1);
+                const int newTaskIdOfs = atomicAdd(&taskOutCounter[0], numChildNodesPerParent * nextParallelism);
                 for (int i = 0; i < numChildNodesPerParent; i++)
                 {
-                    const int childChunkIndex = childChunkIndexStart + i;
-
-                    const int newTaskId = i + newTaskIdOfs;
-                    taskOutChunkId[newTaskId] = childChunkIndex;
-                    taskParallelismOut[newTaskId] = 1; // todo: loadbalance this with decreasing on more depth
-                    taskIndexOut[newTaskId] = 0; // since only 1 task is launched per child, maximum index is 0
-                    chunkDepth[childChunkIndex] = chkDepth + 1;
-                    chunkRangeMin[childChunkIndex] = childNodeRangeMin[i];
-                    chunkRangeMax[childChunkIndex] = childNodeRangeMax[i];
-                    chunkCounter[childChunkIndex] = 0;
-                    chunkType[childChunkIndex] = 1;
-                     
+                    for (int p = 0; p < nextParallelism; p++)
+                    {
+                        const int childChunkIndex = childChunkIndexStart + i;
+                        const int newTaskId = i* nextParallelism +p + newTaskIdOfs;
+                        taskOutChunkId[newTaskId] = childChunkIndex;
+                        taskParallelismOut[newTaskId] = nextParallelism; 
+                        taskIndexOut[newTaskId] = p; // since only 1 task is launched per child, maximum index is 0
+                        chunkDepth[childChunkIndex] = chkDepth + 1;
+                        chunkRangeMin[childChunkIndex] = childNodeRangeMin[i];
+                        chunkRangeMax[childChunkIndex] = childNodeRangeMax[i];
+                        chunkCounter[childChunkIndex] = 0;
+                        chunkType[childChunkIndex] = 1;
+                    }
                     //atomicAdd(&debugBuffer[0], chunkLength[childChunkIndex]);
                     
                 }
