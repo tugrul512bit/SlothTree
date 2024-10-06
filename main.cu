@@ -92,7 +92,7 @@ int main()
         keys[i] = i;
     }
     // searching doesn't require unique keys but same code was reused anyway.
-    std::shuffle(key.begin(), key.end(), std::default_random_engine(seed));
+    std::shuffle(keys.begin(), keys.end(), std::default_random_engine(seed));
 
     size_t t;
     for (int i = 0; i < 5; i++)
