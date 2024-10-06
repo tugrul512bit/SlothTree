@@ -8,6 +8,7 @@
 #include<iostream>
 namespace Sloth
 {
+	#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 	inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
 	{
 		if (code != cudaSuccess)
@@ -15,11 +16,6 @@ namespace Sloth
 			fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
 			if (abort) exit(code);
 		}
-	}
-	inline
-		void gpuErrchk(cudaError_t err)
-	{
-		gpuAssert(err, __FILE__, __LINE__);
 	}
 
 

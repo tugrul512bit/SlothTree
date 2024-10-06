@@ -63,7 +63,7 @@ namespace Sloth
 			{
 
 				auto errCu = cudaMalloc(&data, n * sizeof(Type));
-				Sloth::gpuErrchk(errCu);
+				gpuErrchk(errCu);
 				allocated = true;
 			}
 
@@ -117,11 +117,11 @@ namespace Sloth
 					if (CUDA_SUCCESS != SlothHelper::freeCompressible((void*)data, n * sizeof(Type), true))
 					{
 						std::cout << name << " buffer has CUDA ERROR: compressible memory-free failed. Trying normal deallocation" << std::endl;
-						Sloth::gpuErrchk(cudaFree(data));
+						gpuErrchk(cudaFree(data));
 					}
 				}
 				else
-					Sloth::gpuErrchk(cudaFree(data));
+					gpuErrchk(cudaFree(data));
 			}
 		}
 	};

@@ -330,7 +330,7 @@ namespace Sloth
             __shared__ int smLoadInt[1];
             __shared__ KeyType smLoadKey[1];
             __shared__ char smLoadChar[1];
-            const int chunkId = loadSingle(taskInChunkId, smLoadInt, tid);
+            const int chunkId = loadSingle(taskInChunkId, smLoadInt, tid); taskInParallelism taskOutParallelism
             const int totalWorkSize = loadSingle(chunkLength + chunkId, smLoadInt, tid);
             const int chunkTasks = loadSingle(chunkNumTasks + chunkId, smLoadInt, tid);
             const int chunkOfs = loadSingle(chunkOffset + chunkId, smLoadInt, tid); 
@@ -665,9 +665,67 @@ namespace Sloth
             {
                 chunkType[chunkId] = 2;
             }
-
+            
         }
 
+        template<typename KeyType, typename ValueType>
+        __global__ void copyChunkBack(
+            int* taskInCounter, int* taskInChunkId, char* chunkDepth,
+            int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
+            KeyType* chunkRangeMin, KeyType* chunkRangeMax, int* chunkCounter, char* chunkType,
+            KeyType* keyIn, ValueType* valueIn, KeyType* keyOut, ValueType* valueOut,
+            int* taskOutCounter,
+            int* debugBuffer
+        )
+        {
+            const int tid = threadIdx.x;
+            const int bid = blockIdx.x;
+            const int bs = blockDim.x;
+            const int gs = gridDim.x;
+            const int thread = tid + bid * bs;
+            __shared__ int smLoadInt[1];
+            __shared__ KeyType smLoadKey[1];
+            __shared__ char smLoadChar[1];
+            const int chunkId = loadSingle(taskInChunkId, smLoadInt, tid);
+            const int totalWorkSize = loadSingle(chunkLength + chunkId, smLoadInt, tid);
+            const int chunkTasks = loadSingle(chunkNumTasks + chunkId, smLoadInt, tid);
+            const int chunkOfs = loadSingle(chunkOffset + chunkId, smLoadInt, tid);
+            const KeyType chunkMin = loadSingle(chunkRangeMin + chunkId, smLoadKey, tid);
+            const KeyType chunkMax = loadSingle(chunkRangeMax + chunkId, smLoadKey, tid);
+            const char chkDepth = loadSingle(chunkDepth + chunkId, smLoadChar, tid);
+            const int chunkLen = loadSingle(chunkLength + chunkId, smLoadInt, tid);
+
+            // if parent range is [0,640] and if there are 64 children per node, then each child will have 10 sized range, [0,9],[10,19],...
+            const int chunkChildRange = ((double)chunkMax - (double)chunkMin) / numChildNodesPerParent;
+
+
+
+            // if ranges are too small or if it is a leaf-node, do not create child nodes
+            if ((chunkChildRange < 1) || (totalWorkSize <= taskThreads) || (chkDepth > nodeMaxDepth))
+                return;
+            const int chunkStride = taskThreads * chunkTasks;
+            const int strideThreadId = tid + (bid % chunkTasks) * bs;
+
+            if (strideThreadId == 0)
+            {
+                const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
+                printf(" (id=%i) ", chunkId);
+                for (int i = 0; i < numChildNodesPerParent; i++)
+                {
+                    const int childChunkIndex = childChunkIndexStart + i;
+                    const int copyStart = chunkOffset[childChunkIndex];
+                    const int copyLen = chunkLength[childChunkIndex];
+                    for (int j = 0; j < copyLen; j++)
+                    {
+                        keyIn[copyStart + j] = keyOut[copyStart + j];
+                        valueIn[copyStart + j] = valueOut[copyStart + j];
+                        atomicAdd(&debugBuffer[0], 1);
+                    }
+                }
+
+
+            }
+        }
 
 
         // for each children created, add 1 task. adds to task counter atomically so tasks are not sorted but they keep id values to reach their target
@@ -677,7 +735,8 @@ namespace Sloth
             int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
             KeyType* chunkRangeMin, KeyType* chunkRangeMax, int* chunkCounter, char* chunkType,
             KeyType* keyIn, ValueType* valueIn, KeyType* keyOut, ValueType* valueOut,
-            int* taskOutCounter,
+            int * taskOutCounter,
+            int * taskOutChunkId,
             int* debugBuffer
         )
         {
@@ -746,6 +805,12 @@ namespace Sloth
                     taskOutChunkId[newTaskId] = childChunkIndex;
                     chunkNumTasks[childChunkIndex] = 1; // todo: loadbalance this with decreasing on more depth
                     chunkDepth[childChunkIndex] = chkDepth + 1;
+                    chunkRangeMin[childChunkIndex] = childNodeRangeMin[i];
+                    chunkRangeMax[childChunkIndex] = childNodeRangeMax[i];
+                    chunkCounter[childChunkIndex] = 0;
+                    chunkType[childChunkIndex] = 1;
+                     
+                    printf(" [  %i  ] ", chunkLength[childChunkIndex]);
                     /*
                     int* taskInCounter, int* taskInChunkId,
                         int* chunkLength, int* chunkProgress, int* chunkNumTasks, int* chunkOffset,
@@ -780,6 +845,7 @@ namespace Sloth
         // keyin/out valuein/out are elements
         std::shared_ptr<Sloth::Buffer<int>> taskInCounter;
         std::shared_ptr<Sloth::Buffer<int>> taskInChunkId;
+
 
         std::shared_ptr<Sloth::Buffer<int>> taskOutCounter;
         std::shared_ptr<Sloth::Buffer<int>> taskOutChunkId;
@@ -875,10 +941,12 @@ namespace Sloth
                 keyIn->CopyFrom(keys.data(), inputSize);
                 valueIn->CopyFrom(values.data(), inputSize);
                 // starting n tasks depending on chunk length
-                const int nTasks = 1 + (inputSize / ( 16*TreeInternalKernels::taskThreads));
+                int nTasks = 1 + (inputSize / ( 16*TreeInternalKernels::taskThreads));
 
                 minMaxWorkCounter->Set(0, 0);
                 // compute min-max range for first step
+                inputMinMax->Set(0, TreeInternalKernels::iMax);
+                inputMinMax->Set(1, TreeInternalKernels::iMin);
                 TreeInternalKernels::minMaxReduction << <nTasks, TreeInternalKernels::taskThreads >> > (keyIn->Data(), minMaxWorkCounter->Data(), inputSize, inputMinMax->Data());
                 cudaDeviceSynchronize();
 
@@ -949,8 +1017,8 @@ namespace Sloth
                         debugBuffer->Data()
                         );
 
-                    // recursion part
-                    TreeInternalKernels::createTask << <nTasks, TreeInternalKernels::taskThreads >> > (
+
+                    TreeInternalKernels::copyChunkBack << <nTasks, TreeInternalKernels::taskThreads >> > (
                         taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
                         chunkLength->Data(), chunkProgress->Data(), chunkNumTasks->Data(), chunkOffset->Data(),
                         chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
@@ -959,18 +1027,40 @@ namespace Sloth
                         debugBuffer->Data()
                         );
 
+
+                    // recursion part                    
+                    TreeInternalKernels::createTask << <nTasks, TreeInternalKernels::taskThreads >> > (
+                        taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
+                        chunkLength->Data(), chunkProgress->Data(), chunkNumTasks->Data(), chunkOffset->Data(),
+                        chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
+                        keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                        taskOutCounter->Data(),
+                        taskOutChunkId->Data(),
+                        debugBuffer->Data()
+                        );
+
                     gpuErrchk(cudaDeviceSynchronize());
 
                     const int numNewTasks = taskOutCounter->Get(0);
-                    taskOutCounter->DeviceCopyTo(taskInCounter->Data(), numNewTasks);
-                    keyOut->DeviceCopyTo(keyIn->Data(), inputSize);
-                    valueOut->DeviceCopyTo(valueIn->Data(), inputSize);
+                    taskOutCounter->DeviceCopyTo(taskInCounter->Data(), 1);
+                    taskOutChunkId->DeviceCopyTo(taskInChunkId->Data(), numNewTasks);
+                    taskOutCounter->Set(0, 0);
 
+
+#ifdef SLOTH_DEBUG_ENABLED
+                    std::cout << "num tasks = " << numNewTasks << std::endl;
+                    std::cout << "debug: " << debugBuffer->Get(0) << std::endl;
+                    debugBuffer->Set(0,0);
+#endif
+                    nTasks = numNewTasks;
                     working = (numNewTasks > 0);
                 }
+
+
 #ifdef SLOTH_DEBUG_ENABLED
                 std::cout << "input range min: " << inputMinMax->Get(0) << std::endl;
                 std::cout << "input range max: " << inputMinMax->Get(1) << std::endl;
+                std::cout << "debug: " << debugBuffer->Get(0) << std::endl;
                 int sum = 0;
                 for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
                 {
