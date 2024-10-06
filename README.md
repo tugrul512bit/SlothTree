@@ -86,3 +86,18 @@ cpu: 0.0812151s
  found: 1
  found value: 15 real value: 15
 ```
+
+# Building a Tree With CUDA
+
+- Input array is taken as a single chunk
+- Chunk is mapped to N number of tasks
+- Each task is a single block of CUDA threads
+- Single kernel launch computes all tasks
+- Preprocessing: array's value range is computed with a min-max reduction. Reduction in registers, then reduction in shared memory then atomicMin and atomicMax once per block (N per task). This is written to root chunk's properties.
+- Phase 1: tasks count occurences of keys falling in boundaries of child nodes (if there are 4 child nodes per parent, then there are 4 accumulators for 4 different key ranges that divide parent's range equally)
+- Phase 2: tasks calculate offsets or starting index values of keys of child nodes
+- Phase 3: tasks allocate enough space on target array and copy the contents of nodes (chunks) to target. Allocation is done through a simple atomic increment between tasks and a preallocated buffer is used for target space. So there is no real allocation happening.
+- Phase 4: tasks generate new tasks depending on node depth level, number of elements inside node and size of child node ranges
+- Phase 5: book-keeping variables are resetted and loops to phase 1 until there are no tasks generated
+
+![Top-down approach](https://github.com/tugrul512bit/SlothTree/blob/master/sloth-tree.drawio.png)
