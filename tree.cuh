@@ -347,7 +347,9 @@ namespace Sloth
             // if parent range is [0,640] and if there are 64 children per node, then each child will have 10 sized range, [0,9],[10,19],...
             const int chunkChildRange = ((double)chunkMax - (double)chunkMin) / numChildNodesPerParent;
 
-    
+            // if ranges are too small or if it is a leaf-node, do not create child nodes
+            if ((chunkChildRange < 1) || (totalWorkSize <= nodeElements) || (chkDepth > nodeMaxDepth))
+                return;
 
             // chunk is processed in multiple leaps of this stride 
             const int chunkStride = bs * chunkTasks;
@@ -355,7 +357,7 @@ namespace Sloth
             const int numStrides = 1 + (totalWorkSize - 1) / chunkStride;
             
             const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
-            // if a chunk is being processed, it is at least a node (value of 2 means leaf node)
+
             if (strideThreadId == 0)
             {
                 
@@ -364,6 +366,12 @@ namespace Sloth
                 {
                     const int childChunkIndex = childChunkIndexStart + j;
                     chunkLength[childChunkIndex] = 0; 
+                    chunkCounter[childChunkIndex] = 0;
+                    chunkDepth[childChunkIndex] = 0;
+                    chunkOffset[childChunkIndex] = 0;
+                    chunkRangeMin[childChunkIndex] = 0;
+                    chunkRangeMax[childChunkIndex] = 0;
+                    
                 }
             }
         }
@@ -469,15 +477,10 @@ namespace Sloth
                 if (tid == 0)
                 {
                     // global reduction
-                    atomicAdd(&chunkLength[childChunkIndex], sum);
-
+                    if(sum>0)
+                        atomicAdd(&chunkLength[childChunkIndex], sum);
                 }
 
-                // only 1 thread of chunk is resetting this value for later kernels
-                if (strideThreadId == 0)
-                {
-                    chunkCounter[childChunkIndex] = 0;
-                }
             }
         }
 
@@ -670,14 +673,15 @@ namespace Sloth
 
                     const int targetOffset = absoluteChildChunkOffsets[j];
                     const int childChunkIndex = childChunkIndexStart + j;
-                    if (tid == 0)
+
+                    if (tid == 0 && nCompacted>0)
                     {
                         smTargetIndex = atomicAdd(&chunkCounter[childChunkIndex], nCompacted); // reducing global atomics by nCompacted times
                     }
                     __syncthreads();
                     const int targetIndex = smTargetIndex;
 
-                    if (tid < nCompacted)
+                    if (tid < nCompacted && nCompacted > 0)
                     {                        
                        keyOut[tid + targetOffset + targetIndex]=keyCompacted;
                        valueOut[tid + targetOffset + targetIndex]=valueCompacted;
@@ -759,9 +763,9 @@ namespace Sloth
 
                     if (currentId < copyLen)
                     {
-                        keyIn[copyStart + strideThreadId] = keyOut[copyStart + strideThreadId];
-                        valueIn[copyStart + strideThreadId] = valueOut[copyStart + strideThreadId];
-
+                        keyIn[copyStart + currentId] = keyOut[copyStart + currentId];
+                        valueIn[copyStart + currentId] = valueOut[copyStart + currentId];
+                        ;
                     }
                 }
             }
@@ -808,7 +812,7 @@ namespace Sloth
             const char chkDepth = loadSingle(chunkDepth + chunkId, smLoadChar, tid);
 
             // if parent range is [0,640] and if there are 64 children per node, then each child will have 10 sized range, [0,9],[10,19],...
-            const int chunkChildRange = ((double)chunkMax - (double)chunkMin) / numChildNodesPerParent;
+            const int chunkChildRange = ((long)chunkMax - (long)chunkMin) / numChildNodesPerParent;
 
 
 
@@ -837,7 +841,7 @@ namespace Sloth
                 childNodeRangeMax[i] = curEnd;
                 curBegin = curEnd + 1;
             }
-
+            
             const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
 
             // create tasks for children
@@ -859,6 +863,7 @@ namespace Sloth
                         chunkRangeMax[childChunkIndex] = childNodeRangeMax[i];
                         chunkCounter[childChunkIndex] = 0;
                         chunkType[childChunkIndex] = 1;
+                       
                     }
 
                 }
@@ -1035,7 +1040,7 @@ namespace Sloth
                 taskInChunkId->CopyFrom(tasks.data(),nTasks);
                 taskParallelismIn->CopyFrom(tasks2.data(), nTasks);
                 taskIndexIn->CopyFrom(tasks3.data(), nTasks);
-              
+                
 
                 bool working = true;
                 int maxDebugCtr = 30;
@@ -1153,12 +1158,29 @@ namespace Sloth
                 std::cout << "-------------------------------" << std::endl;
 #endif
             }
-            std::cout << "gpu: " << t / 1000000000.0 << "s" << std::endl;
+            std::cout << "build gpu: " << t / 1000000000.0 << "s" << std::endl;
 
           
 
         }
 
+        // checks existence of multiple keys in tree. Sets existence conditions in foundOut buffer and assigns values(of keys) to valuesOut buffer
+        void FindKeyGpu(KeyType* keysIn, ValueType* valuesOut, bool * foundOut)
+        {
+            /* 
+                Same as Cpu version, but in parallel. Traversing is handled in tasks. Starts with N tasks, all tasks work on single chunk(of all inputs).
+                When inputs enter a child node, new tasks are created only for those. Now N/k tasks work per child node. After a certain depth,
+                number of tasks per node decreases to 1.
+
+                - Start with root
+                - check if type of node is 1 (leaf node)
+                - - iterate elements inside the node
+                - - when "key" is same as input key, take its "value" and put it in a bucket (by stream compaction or atomics)
+                
+            */ 
+        }
+
+        // checks if a key is in tree, returns true if it exists. Also sets its value(of key) to the parameter "value".
         bool FindKeyCpu(KeyType key, ValueType & value)
         {
             std::queue<int> indexQueue;
@@ -1191,24 +1213,25 @@ namespace Sloth
 
 #ifdef SLOTH_DEBUG_ENABLED
                                 std::cout << "found at depth:" << depth << std::endl;
-                                std::cout << "found at range:" << rangeMin<<" "<<rangeMax << std::endl;
+                                std::cout << "found at range:" << rangeMin << " " << rangeMax << std::endl;
 #endif
                                 return true;
                             }
                         }
                     }
-                    else
+                    else if (type == 2)
                     {
-                        if (type == 2)
+                        for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
                         {
-                            for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
-                            {
-                                indexQueue.push(index * TreeInternalKernels::numChildNodesPerParent + 1 + i);
-                            }
+                            indexQueue.push(index * TreeInternalKernels::numChildNodesPerParent + 1 + i);
                         }
                     }
-                }
+                    else
+                    {
+                        std::cout << " invalid node found " << std::endl;
+                    }
 
+                }
               
                 if (depth > TreeInternalKernels::nodeMaxDepth)
                     break;
