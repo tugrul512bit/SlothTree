@@ -19,7 +19,7 @@ Up to 30x faster than std::unordered_map for inserting same number of random ele
 
 Finding element (under development):
 
-Up to 30x faster than std::unortered_map for finding multiple keys and 3000x faster than brute-force scanning array. 
+Up to 8x faster than std::unortered_map for finding multiple keys and 3000x faster than brute-force scanning array. 
 
 Todo: optimize leaf nodes with sorting & binary-search.
 
@@ -120,7 +120,7 @@ int main()
         keys[i] = i;
     }
     // searching doesn't require unique keys but same code was reused anyway.
-    std::shuffle(key.begin(), key.end(), std::default_random_engine(seed));
+    std::shuffle(keys.begin(), keys.end(), std::default_random_engine(seed));
 
     size_t t;
     for (int i = 0; i < 5; i++)
@@ -181,6 +181,7 @@ int main()
     return 0;
 }
 
+
 ```
 
 Output:
@@ -215,28 +216,28 @@ build gpu: 0.0304177s
  found value: 15 real value: 15
 build std::unordered_map: 1.11404s
  =========================== Benchmarking Search Operation ============================
-find std::unordered_map: 0.281693s
-simple find gpu: 0.0574773s
-simple find gpu: 0.0125695s
-simple find gpu: 0.0110345s
-simple find gpu: 0.0110986s
-simple find gpu: 0.0111087s
-simple find gpu: 0.0111835s
-simple find gpu: 0.0110757s
-simple find gpu: 0.0110935s
-simple find gpu: 0.0111551s
-simple find gpu: 0.0128292s
-find std::unordered_map: 0.301685s
-simple find gpu: 0.0114173s
-simple find gpu: 0.0110771s
-simple find gpu: 0.0111175s
-simple find gpu: 0.0111261s
-simple find gpu: 0.0111066s
-simple find gpu: 0.0110424s
-simple find gpu: 0.0130347s
-simple find gpu: 0.0149974s
-simple find gpu: 0.0110752s
-simple find gpu: 0.0110937s
+find std::unordered_map: 0.205048s
+simple find gpu: 0.06739s
+simple find gpu: 0.025621s
+simple find gpu: 0.0256685s
+simple find gpu: 0.0255597s
+simple find gpu: 0.0260123s
+simple find gpu: 0.0255821s
+simple find gpu: 0.0256576s
+simple find gpu: 0.0255937s
+simple find gpu: 0.0256322s
+simple find gpu: 0.0257908s
+find std::unordered_map: 0.206452s
+simple find gpu: 0.0273387s
+simple find gpu: 0.0255418s
+simple find gpu: 0.0256064s
+simple find gpu: 0.025808s
+simple find gpu: 0.0256079s
+simple find gpu: 0.025541s
+simple find gpu: 0.0255673s
+simple find gpu: 0.0259154s
+simple find gpu: 0.0255716s
+simple find gpu: 0.0255605s
 ```
 
 # Building a Tree With CUDA
