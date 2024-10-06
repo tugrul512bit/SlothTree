@@ -333,10 +333,12 @@ namespace Sloth
             __shared__ KeyType smLoadKey[1];
             __shared__ char smLoadChar[1];
 
+            // task index is linearly increasing within each chunk. maximum number of blocks per chunk
+            const int taskIndex = loadSingle(taskIdIn + bid, smLoadInt, tid); // 1 block per task
             const int chunkTasks = loadSingle(taskParallelismIn + bid, smLoadInt, tid); // 1 block per task
             const int chunkId = loadSingle(taskInChunkId + bid, smLoadInt, tid);
             const int totalWorkSize = loadSingle(chunkLength + chunkId, smLoadInt, tid);
-            const int chunkOfs = loadSingle(chunkOffset + chunkId, smLoadInt, tid); 
+            const int chunkOfs = loadSingle(chunkOffset + chunkId, smLoadInt, tid);
             const KeyType chunkMin = loadSingle(chunkRangeMin + chunkId, smLoadKey, tid);
             const KeyType chunkMax = loadSingle(chunkRangeMax + chunkId, smLoadKey, tid);
             const char chkDepth = loadSingle(chunkDepth + chunkId, smLoadChar, tid);
@@ -1000,7 +1002,8 @@ namespace Sloth
                 chunkDepth->Set(0, 0);// root is depth 0
                 chunkRangeMin->Set(0, inputMinMax->Get(0));
                 chunkRangeMax->Set(0, inputMinMax->Get(1));
-                taskParallelismIn->Set(0, nTasks);
+                
+                
                 chunkLength->Set(0, inputSize);
                 chunkOffset->Set(0, 0);// chunk starts at 0th element
                 chunkProgress->Set(0, 0); // tasks coordinate with this atomically
@@ -1008,14 +1011,17 @@ namespace Sloth
 
                 // number of tasks launched
                 taskInCounter->Set(0, nTasks);
-                std::vector<int> tasks(nTasks);
+                std::vector<int> tasks(nTasks),tasks2(nTasks),tasks3(nTasks);
                 for (int i = 0; i < nTasks; i++)
                 {                    
                     tasks[i] = 0;
-                    
+                    tasks2[i] = nTasks;
+                    tasks3[i] = i;
                 }
                 taskInChunkId->CopyFrom(tasks.data(),nTasks);
-                
+                taskParallelismIn->CopyFrom(tasks2.data(), nTasks);
+                taskIndexIn->CopyFrom(tasks3.data(), nTasks);
+              
 
                 bool working = true;
                 int maxDebugCtr = 30;
