@@ -739,27 +739,35 @@ namespace Sloth
             // chunk is processed in multiple leaps of this stride 
             const int chunkStride = bs * chunkTasks;
             const int strideThreadId = tid + taskIndex * bs; // this allows variable amount of tasks per chunk within same kernel
-            const int numStrides = 1 + (totalWorkSize - 1) / chunkStride;
+      
 
-            if (strideThreadId == 0)
+            
+            
+            const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
+
+            for (int i = 0; i < numChildNodesPerParent; i++)
             {
-                const int childChunkIndexStart = chunkId * numChildNodesPerParent + 1;
-                
-                for (int i = 0; i < numChildNodesPerParent; i++)
+                const int childChunkIndex = childChunkIndexStart + i;
+                const int copyStart = loadSingle(&chunkOffset[childChunkIndex],smLoadInt,tid);
+                const int copyLen = loadSingle(&chunkLength[childChunkIndex],smLoadInt,tid);
+
+                const int numIter = 1 + copyLen / chunkStride;
+                for (int iter = 0; iter < numIter; iter++)
                 {
-                    const int childChunkIndex = childChunkIndexStart + i;
-                    const int copyStart = chunkOffset[childChunkIndex];
-                    const int copyLen = chunkLength[childChunkIndex];
-                    for (int j = 0; j < copyLen; j++)
+                    const int currentId = strideThreadId + iter * chunkStride;
+                    if (strideThreadId == 0)
+                        printf("( %i )", chunkLength[childChunkIndex]);
+                    if (currentId < copyLen)
                     {
-                        keyIn[copyStart + j] = keyOut[copyStart + j];
-                        valueIn[copyStart + j] = valueOut[copyStart + j];
-                        //atomicAdd(&debugBuffer[0], 1);
+                        keyIn[copyStart + strideThreadId] = keyOut[copyStart + strideThreadId];
+                        valueIn[copyStart + strideThreadId] = valueOut[copyStart + strideThreadId];
+                        atomicAdd(&debugBuffer[0], 1);
                     }
                 }
-
-
             }
+
+
+            
         }
 
 
@@ -1120,6 +1128,7 @@ namespace Sloth
 #endif
                     nTasks = numNewTasks;
                     working = (numNewTasks > 0);
+                    break;
                 }
 
 
