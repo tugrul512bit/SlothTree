@@ -96,8 +96,11 @@ cpu: 0.0812151s
 - Preprocessing: array's value range is computed with a min-max reduction. Reduction in registers, then reduction in shared memory then atomicMin and atomicMax once per block (N per task). This is written to root chunk's properties.
 - Phase 1: tasks count occurences of keys falling in boundaries of child nodes (if there are 4 child nodes per parent, then there are 4 accumulators for 4 different key ranges that divide parent's range equally)
 - Phase 2: tasks calculate offsets or starting index values of keys of child nodes
-- Phase 3: tasks allocate enough space on target array and copy the contents of nodes (chunks) to target. Allocation is done through a simple atomic increment between tasks and a preallocated buffer is used for target space. So there is no real allocation happening.
+- Phase 3: tasks allocate enough space on target array and copy the contents of nodes (chunks) to target.
 - Phase 4: tasks generate new tasks depending on node depth level, number of elements inside node and size of child node ranges
 - Phase 5: book-keeping variables are resetted and loops to phase 1 until there are no tasks generated
+- All allocations are only computed on a preallocated array by using atomicAdd on an offset variable.
+- All objects are in form of struct-of-arrays because SOA is more efficient to read/write in parallel than AOS. When a field is required, only that information is accessed and memory bank conflicts, serializations are minimized.
+- Tree of 1 million elements take roughly 2 milliseconds on a RTX4070 with 5888 CUDA pipelines while inserting same data to an std::unordered_map takes 70-90 milliseconds on a Ryzen7900 core. Despite having 40% warp occupancy and 50% of maximum in-flight warps, GPU is nearly 40 times faster to build a tree. 
 
 ![Top-down approach](https://github.com/tugrul512bit/SlothTree/blob/master/sloth-tree.drawio.png)
