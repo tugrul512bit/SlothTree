@@ -1,6 +1,6 @@
 # SlothTree
 
-If a Ryzen CPU core is a strong bear, then a single CUDA pipeline a lazy sloth. If both are racing to get apples from a tree, 1 at a time, the bear always wins by a large margin:
+If a Ryzen CPU core is a bear, then a single CUDA pipeline is a sloth. If both compete to get apple from a tree, 1 at a time, the bear always wins by a large margin:
 
 - bear: 1 apple per 15 seconds --> 240 apples per hour
 - sloth: 1 apple per hour
@@ -19,7 +19,7 @@ Up to 40x faster than std::unordered_map for inserting same number of random ele
 
 Finding element:
 
-Under development.
+Under development. Ideas: sorting the input should improve the searching because of reducing warp divergence. Sorting between each depth phase should also decrease warp divergence but these require only partial sorting. Perhaps sorting should start only after a certain depth and be fully parallel like sorting 10000 arrays of sizes 128. Without any sorting, maybe binning can help. But it requires extra space.
 
 Sample code:
 ```C++
@@ -86,3 +86,29 @@ cpu: 0.0812151s
  found: 1
  found value: 15 real value: 15
 ```
+
+# Building a Tree With CUDA
+
+- Input array is taken as a single chunk
+- Chunk is mapped to N number of tasks
+- Each task is a single block of CUDA threads
+- Single kernel launch computes all tasks
+- Preprocessing: array's value range is computed with a min-max reduction. Reduction in registers, then reduction in shared memory then atomicMin and atomicMax once per block (N per task). This is written to root chunk's properties.
+- Phase 1: tasks count occurences of keys falling in boundaries of child nodes (if there are 4 child nodes per parent, then there are 4 accumulators for 4 different key ranges that divide parent's range equally)
+- Phase 2: tasks calculate offsets or starting index values of keys of child nodes
+- Phase 3: tasks allocate enough space on target array and copy the contents of nodes (chunks) to target.
+- Phase 4: tasks generate new tasks depending on node depth level, number of elements inside node and size of child node ranges
+- Phase 5: book-keeping variables are resetted and loops to phase 1 until there are no tasks generated
+- All allocations are only computed on a preallocated array by using atomicAdd on an offset variable.
+- All objects are in form of struct-of-arrays because SOA is more efficient to read/write in parallel than AOS. When a field is required, only that information is accessed and memory bank conflicts, serializations are minimized.
+- Tree of 1 million elements take roughly 2 milliseconds on a RTX4070 with 5888 CUDA pipelines while inserting same data to an std::unordered_map takes 70-90 milliseconds on a Ryzen7900 core. Despite having 40% warp occupancy and 50% of maximum in-flight warps, GPU is nearly 40 times faster to build a tree. 
+
+![Top-down approach](https://github.com/tugrul512bit/SlothTree/blob/master/sloth-tree.drawio.png)
+
+# Separating Chunks
+
+- Allocating chunks requires counting the number of elements. This is computed with parallel reduction in shared memory and warp shuffle. From 128 elements to 32 elements, shared memory is used. From 32 elements to 1 element, warp shuffle is used.
+- Moving millions of elements to their target with only atomics-based offset computation is slow. Due to this, multiple elements are extracted from 128-sized regions by parallel stream-compaction.
+- This is repeated for each child node chunk
+
+![counting & compacting](https://github.com/tugrul512bit/SlothTree/blob/master/separating-chunks.drawio.png)
