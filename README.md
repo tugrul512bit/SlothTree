@@ -19,7 +19,7 @@ Up to 40x faster than std::unordered_map for inserting same number of random ele
 
 Finding element:
 
-Under development.
+Under development. Ideas: sorting the input should improve the searching because of reducing warp divergence. Sorting between each depth phase should also decrease warp divergence but these require only partial sorting. Perhaps sorting should start only after a certain depth and be fully parallel like sorting 10000 arrays of sizes 128. Without any sorting, maybe binning can help. But it requires extra space.
 
 Sample code:
 ```C++
