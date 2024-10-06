@@ -6,7 +6,7 @@
 #include<unordered_map>
 namespace Sloth
 {
-#define SLOTH_DEBUG_ENABLED
+//#define SLOTH_DEBUG_ENABLED
 
     namespace TreeInternalKernels
     {
@@ -19,8 +19,8 @@ namespace Sloth
         // each task is 1 block of threads
         // each chunk can have multiple tasks
         static constexpr int taskThreads = 128;
-        static constexpr int nodeElements = 128;
-        static constexpr int nodeMaxDepth = 10;
+        static constexpr int nodeElements = 1024;
+        static constexpr int nodeMaxDepth =10;
         static constexpr int numChildNodesPerParent =4;
         
        
@@ -760,7 +760,7 @@ namespace Sloth
                     {
                         keyIn[copyStart + strideThreadId] = keyOut[copyStart + strideThreadId];
                         valueIn[copyStart + strideThreadId] = valueOut[copyStart + strideThreadId];
-                        atomicAdd(&debugBuffer[0], 1);
+
                     }
                 }
             }
@@ -859,8 +859,7 @@ namespace Sloth
                         chunkCounter[childChunkIndex] = 0;
                         chunkType[childChunkIndex] = 1;
                     }
-                    //atomicAdd(&debugBuffer[0], chunkLength[childChunkIndex]);
-                    
+
                 }
             }
         }
@@ -996,7 +995,7 @@ namespace Sloth
                 keyIn->CopyFrom(keys.data(), inputSize);
                 valueIn->CopyFrom(values.data(), inputSize);
                 // starting n tasks depending on chunk length
-                int nTasks = 1 + (inputSize / ( 16*TreeInternalKernels::taskThreads));
+                int nTasks = 1 + (inputSize / ( 4*TreeInternalKernels::taskThreads));
 
                 minMaxWorkCounter->Set(0, 0);
                 // compute min-max range for first step
