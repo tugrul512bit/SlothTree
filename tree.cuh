@@ -755,8 +755,7 @@ namespace Sloth
                 for (int iter = 0; iter < numIter; iter++)
                 {
                     const int currentId = strideThreadId + iter * chunkStride;
-                    if (strideThreadId == 0)
-                        printf("( %i )", chunkLength[childChunkIndex]);
+
                     if (currentId < copyLen)
                     {
                         keyIn[copyStart + strideThreadId] = keyOut[copyStart + strideThreadId];
@@ -851,7 +850,7 @@ namespace Sloth
                     const int newTaskId = i + newTaskIdOfs;
                     taskOutChunkId[newTaskId] = childChunkIndex;
                     taskParallelismOut[newTaskId] = 1; // todo: loadbalance this with decreasing on more depth
-                    taskIndexOut[newTaskId] = i;
+                    taskIndexOut[newTaskId] = 0; // since only 1 task is launched per child, maximum index is 0
                     chunkDepth[childChunkIndex] = chkDepth + 1;
                     chunkRangeMin[childChunkIndex] = childNodeRangeMin[i];
                     chunkRangeMax[childChunkIndex] = childNodeRangeMax[i];
@@ -1115,7 +1114,8 @@ namespace Sloth
 
                     const int numNewTasks = taskOutCounter->Get(0);
                     taskOutCounter->DeviceCopyTo(taskInCounter->Data(), 1);
-                    taskOutChunkId->DeviceCopyTo(taskInChunkId->Data(), numNewTasks);
+                    taskOutChunkId->DeviceCopyTo(taskInChunkId->Data(), numNewTasks); 
+                    
                     taskParallelismOut->DeviceCopyTo(taskParallelismIn->Data(), numNewTasks);
                     taskIndexOut->DeviceCopyTo(taskIndexIn->Data(), numNewTasks);
                     taskOutCounter->Set(0, 0);
@@ -1128,7 +1128,7 @@ namespace Sloth
 #endif
                     nTasks = numNewTasks;
                     working = (numNewTasks > 0);
-                    break;
+                   // break;
                 }
 
 
