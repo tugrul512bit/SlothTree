@@ -20,8 +20,8 @@ namespace Sloth
         // each task is 1 block of threads
         // each chunk can have multiple tasks
         static constexpr int taskThreads = 128;
-        static constexpr int nodeElements = 1024;
-        static constexpr int nodeMaxDepth =8;
+        static constexpr int nodeElements = 128;
+        static constexpr int nodeMaxDepth =10;
         static constexpr int numChildNodesPerParent =4;
         
        
@@ -35,6 +35,37 @@ namespace Sloth
                 __syncthreads();
                 // shared reduction
                 for (unsigned int i = ((unsigned int)taskThreads) >> 1; i > 16; i >>= 1)
+                {
+                    if (id < i)
+                        sm[id] += sm[id + i];
+                    __syncthreads();
+                }
+                Type result;
+                if (id < 32)
+                {
+                    result = sm[id];
+                    // warp reduction
+                    for (unsigned int i = 16; i > 0; i >>= 1)
+                    {
+                        result += __shfl_sync(0xffffffff, result, i + (id & 31));
+                    }
+                }
+                __syncthreads();
+                if (id == 0)
+                    sm[0] = result;
+                __syncthreads();
+                result = sm[0];
+                __syncthreads();
+                return result;
+            }
+
+            template<int numThreads>
+            __device__ Type BlockSum2(const int id, const Type val, Type* sm)
+            {
+                sm[id] = val;
+                __syncthreads();
+                // shared reduction
+                for (unsigned int i = ((unsigned int)numThreads) >> 1; i > 16; i >>= 1)
                 {
                     if (id < i)
                         sm[id] += sm[id + i];
@@ -874,19 +905,17 @@ namespace Sloth
         // optimized for coalesced access from all threads so global memory will be efficiently used (assuming warp divergence is not high)
         // also branch-free
         template<typename Type>
-        struct Queue
+        struct Stack
         {
         private:
             int head;
-            int tail;
             int n;
             int stride;
             int threadId;
         public:
-            __device__ Queue(const int nData, const int nTotalThreads, const int strideThreadId)
+            __device__ Stack(const int nData, const int nTotalThreads, const int strideThreadId)
             {
                 head = 0; 
-                tail = 0;
                 n = nData;
                 stride = nTotalThreads;
                 threadId = strideThreadId;
@@ -895,14 +924,14 @@ namespace Sloth
             // check size before calling this
             __device__ int pop(Type* queueData)
             {
-                const Type result = queueData[(tail % n)*stride + threadId]; // coalesced & branche-free
-                tail++;
+                head--;
+                const Type result = queueData[(head % n)*stride + threadId]; // coalesced & branche-free                
                 return result;
             }
 
             __device__ int size()
             {
-                return head-tail;
+                return head;
             }
 
             // pay attention to size to not overlow the data
@@ -920,86 +949,96 @@ namespace Sloth
 
             indexQueue: interleaved circular array to work as a parallel queue
         */ 
-        template<typename KeyType, typename ValueType>
+        template<typename KeyType, typename ValueType, int numBlockThreads>
         __global__ void findElements(
             KeyType * searchKeyIn, KeyType * keyIn, ValueType* valueIn, ValueType * valueOut, char * conditionOut,
-            int * indexQueueData, char * chunkDepth, int * chunkOffset, int * chunkLength,
+            int * indexStackData, char * chunkDepth, int * chunkOffset, int * chunkLength,
             KeyType* chunkRangeMin, KeyType* chunkRangeMax,
             char * chunkType, const int numElementsToCompute)
         {
-            const int id = threadIdx.x + blockIdx.x * blockDim.x;
+            const int tid = threadIdx.x;
+            const int id = tid + blockIdx.x * blockDim.x;
             const int totalThreads = blockDim.x * gridDim.x;
-
             const bool compute = id < numElementsToCompute;
-            KeyType key;
-            
+            KeyType key=0;
+
+            __shared__ int smReductionInt[numBlockThreads];
+            Reducer<int> reducer;
+
             if(compute)
                 key = searchKeyIn[id];
 
             ValueType value=-1;
-            bool condition=false;
-
-
+            bool condition = false;
+     
 
             // 64k per input = maximum 100k inputs should be processed at once
-            Queue<int> indexQueue(
-                1 + std::pow(TreeInternalKernels::numChildNodesPerParent, TreeInternalKernels::nodeMaxDepth),
+            Stack<int> indexStack(
+                1 + (TreeInternalKernels::numChildNodesPerParent * nodeMaxDepth),
                 totalThreads,
                 id
             );
 
             // start with root node index
-            indexQueue.push(0,indexQueueData);
+            if(compute)
+                indexStack.push(0,indexStackData);
+            int breakLoop = (compute ? 0 : 1);      
 
-            bool breakLoop = false;
-            
-            while (compute && indexQueue.size() > 0)
+            char depth = 0;
+            while (true)
             {
-                const int index = indexQueue.pop(indexQueueData);                
-                const int depth = chunkDepth[index];
-                const KeyType rangeMin = chunkRangeMin[index];
-                const KeyType rangeMax = chunkRangeMax[index];
-                const char type = chunkType[index];
-
-                // todo: add a syncthreads with a fully-inclusive condition check (such as if all are still running, to decrease divergence)
-
-               
-
-                
-                if (key >= rangeMin && key <= rangeMax)
+                if (compute && (breakLoop == 0))
                 {
-                    // leaf node, check elements
-                    if (type == 1)
+                    const int index = indexStack.pop(indexStackData);
+                    depth = chunkDepth[index];
+                    const KeyType rangeMin = chunkRangeMin[index];
+                    const KeyType rangeMax = chunkRangeMax[index];
+                    const char type = chunkType[index];
+
+
+                    // todo: add a syncthreads with a fully-inclusive condition check (such as if all are still running, to decrease divergence)
+                    if (key >= rangeMin && key <= rangeMax)
                     {
-                        const int offset = chunkOffset[index];
-                        const int length = chunkLength[index];
-                        for (int i = 0; i < length; i++)
-                        {
-                            const int elementIndex = offset + i;
-                            if (keyIn[elementIndex] == key)
+                        // leaf node, check elements
+                        if (type == 1)
+                        {                    
+                            const int offset = chunkOffset[index];
+                            const int length = chunkLength[index];
+                            for (int i = 0; i < length; i++)
                             {
-                                value = valueIn[elementIndex];
-                                condition = true;
-                                breakLoop = true;
-                                break;
+                                const int elementIndex = offset + i;
+                                if (keyIn[elementIndex] == key)
+                                {
+                                    value = valueIn[elementIndex];
+                                    condition = true;
+                                    breakLoop = 1;
+                                    break;
+                                }
+                            }
+                            
+                        }
+                        else if (type == 2)
+                        {
+                            for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
+                            {
+                                indexStack.push(index * TreeInternalKernels::numChildNodesPerParent + 1 + i, indexStackData);
                             }
                         }
-                    }
-                    else if (type == 2)
-                    {
-                        for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
+                        else
                         {
-                            indexQueue.push(index * TreeInternalKernels::numChildNodesPerParent + 1 + i,indexQueueData);
+                            printf(" invalid node found "); // this should never happen
                         }
-                    }
-                    else
-                    {
-                        printf(" invalid node found "); // this should never happen
-                    }
 
+                    }
                 }
+             
+                if (depth > TreeInternalKernels::nodeMaxDepth || (indexStack.size() == 0))
+                    breakLoop = 1;
 
-                if (breakLoop || (depth > TreeInternalKernels::nodeMaxDepth))
+                // warp convergence
+                const int totalEnded = reducer.BlockSum2<numBlockThreads>(tid, breakLoop, smReductionInt);
+
+                if (totalEnded == numBlockThreads)
                     break;
             }
 
@@ -1068,7 +1107,7 @@ namespace Sloth
         std::shared_ptr<Sloth::Buffer<int>> searchKeyIndexOut;
         std::shared_ptr<Sloth::Buffer<ValueType>> searchValueOut;
         std::shared_ptr<Sloth::Buffer<char>> searchConditionOut;
-        std::shared_ptr<Sloth::Buffer<int>> indexQueueData;
+        std::shared_ptr<Sloth::Buffer<int>> indexStackData;
         
 
         std::shared_ptr<Sloth::Buffer<int>> minMaxWorkCounter;
@@ -1130,7 +1169,7 @@ namespace Sloth
         {
             const int inputSize = keys.size();
 #ifdef SLOTH_DEBUG_ENABLED
-      
+
             if (debugBufferSize == 0)
             {
                 debugBufferSize = 1024 * 1024 * 100;
@@ -1145,176 +1184,171 @@ namespace Sloth
                 debugBufferSize = 1;
             }
 #endif
-            size_t t;
+
+
+            
+            if (lastInputSize < inputSize)
             {
-                Sloth::Bench bench(&t);
-                if (lastInputSize < inputSize)
-                {
-                    keyIn = std::make_shared< Sloth::Buffer<KeyType>>("keyIn", inputSize, 0, false);
-                    keyOut = std::make_shared< Sloth::Buffer<KeyType>>("keyOut", inputSize, 0, false);
-                    valueIn = std::make_shared< Sloth::Buffer<ValueType>>("valueIn", inputSize, 0, false);
-                    valueOut = std::make_shared< Sloth::Buffer<ValueType>>("valueOut", inputSize, 0, false);
-                    lastInputSize = inputSize;
-                }
-                keyIn->CopyFrom(keys.data(), inputSize);
-                valueIn->CopyFrom(values.data(), inputSize);
-                // starting n tasks depending on chunk length
-                int nTasks = 1 + (inputSize / ( 4*TreeInternalKernels::taskThreads));
-
-                minMaxWorkCounter->Set(0, 0);
-                // compute min-max range for first step
-                inputMinMax->Set(0, TreeInternalKernels::iMax);
-                inputMinMax->Set(1, TreeInternalKernels::iMin);
-                TreeInternalKernels::minMaxReduction << <nTasks, TreeInternalKernels::taskThreads >> > (keyIn->Data(), minMaxWorkCounter->Data(), inputSize, inputMinMax->Data());
-                cudaDeviceSynchronize();
-
-                // first chunk = input array
-                // counter is to coordinate target writing form multiple inputs (multiple threads)
-                chunkCounter->Set(0, 0);
-                chunkDepth->Set(0, 0);// root is depth 0
-                chunkRangeMin->Set(0, inputMinMax->Get(0));
-                chunkRangeMax->Set(0, inputMinMax->Get(1));
-                
-                
-                chunkLength->Set(0, inputSize);
-                chunkOffset->Set(0, 0);// chunk starts at 0th element
-                chunkProgress->Set(0, 0); // tasks coordinate with this atomically
-
-
-                // number of tasks launched
-                taskInCounter->Set(0, nTasks);
-                std::vector<int> tasks(nTasks),tasks2(nTasks),tasks3(nTasks);
-                for (int i = 0; i < nTasks; i++)
-                {                    
-                    tasks[i] = 0;
-                    tasks2[i] = nTasks;
-                    tasks3[i] = i;
-                }
-                taskInChunkId->CopyFrom(tasks.data(),nTasks);
-                taskParallelismIn->CopyFrom(tasks2.data(), nTasks);
-                taskIndexIn->CopyFrom(tasks3.data(), nTasks);
-                
-
-                bool working = true;
-                int maxDebugCtr = 30;
-                while (working)
-                {
-                    if (maxDebugCtr-- == 0)
-                        break;
-                    taskOutCounter->Set(0, 0);
-
-
-                    TreeInternalKernels::resetChunkLength << <nTasks, TreeInternalKernels::taskThreads >> > (
-                        taskIndexIn->Data(),
-                        taskParallelismIn->Data(),
-                        taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
-                        chunkLength->Data(), chunkProgress->Data(), chunkOffset->Data(),
-                        chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
-                        keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
-                        taskOutCounter->Data(),
-                        debugBuffer->Data()
-                        );
-                    TreeInternalKernels::computeChildChunkAllocationRequirements << <nTasks, TreeInternalKernels::taskThreads >> > (
-                        taskIndexIn->Data(),
-                        taskParallelismIn->Data(),
-                        taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
-                        chunkLength->Data(), chunkProgress->Data(),  chunkOffset->Data(),
-                        chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
-                        keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
-                        taskOutCounter->Data(),
-                        debugBuffer->Data()
-                        );
-
-                    TreeInternalKernels::computeChildChunkOffset << <nTasks, TreeInternalKernels::taskThreads >> > (
-                        taskIndexIn->Data(),
-                        taskParallelismIn->Data(),
-                        taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
-                        chunkLength->Data(), chunkProgress->Data(),  chunkOffset->Data(),
-                        chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
-                        keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
-                        taskOutCounter->Data(),
-                        debugBuffer->Data()
-                        );
-
-                    TreeInternalKernels::allocateChildChunkAndCopy << <nTasks, TreeInternalKernels::taskThreads >> > (
-                        taskIndexIn->Data(),
-                        taskParallelismIn->Data(),
-                        taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
-                        chunkLength->Data(), chunkProgress->Data(),  chunkOffset->Data(),
-                        chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
-                        keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
-                        taskOutCounter->Data(),
-                        debugBuffer->Data()
-                        );
-
-
-                    TreeInternalKernels::copyChunkBack << <nTasks, TreeInternalKernels::taskThreads >> > (
-                        taskIndexIn->Data(),
-                        taskParallelismIn->Data(),
-                        taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
-                        chunkLength->Data(), chunkProgress->Data(),  chunkOffset->Data(),
-                        chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
-                        keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
-                        taskOutCounter->Data(),
-                        debugBuffer->Data()
-                        );
-
-
-                    // recursion part                    
-                    TreeInternalKernels::createTask << <nTasks, TreeInternalKernels::taskThreads >> > (
-                        taskIndexIn->Data(),
-                        taskParallelismIn->Data(),
-                        taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
-                        chunkLength->Data(), chunkProgress->Data(),  chunkOffset->Data(),
-                        chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
-                        keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
-                        taskOutCounter->Data(),
-                        taskOutChunkId->Data(),
-                        taskParallelismOut->Data(),
-                        taskIndexOut->Data(),
-                        debugBuffer->Data()
-                        );
-
-                    gpuErrchk(cudaDeviceSynchronize());
-
-                    const int numNewTasks = taskOutCounter->Get(0);
-                    taskOutCounter->DeviceCopyTo(taskInCounter->Data(), 1);
-                    taskOutChunkId->DeviceCopyTo(taskInChunkId->Data(), numNewTasks); 
-                    
-                    taskParallelismOut->DeviceCopyTo(taskParallelismIn->Data(), numNewTasks);
-                    taskIndexOut->DeviceCopyTo(taskIndexIn->Data(), numNewTasks);
-                    taskOutCounter->Set(0, 0);
-
-
-#ifdef SLOTH_DEBUG_ENABLED
-                    std::cout << "num tasks = " << numNewTasks << std::endl;
-                    std::cout << "debug: " << debugBuffer->Get(0) << std::endl;
-                    debugBuffer->Set(0,0);
-#endif
-                    nTasks = numNewTasks;
-                    working = (numNewTasks > 0);
-                   // break;
-                }
-
-
-#ifdef SLOTH_DEBUG_ENABLED
-                std::cout << "input range min: " << inputMinMax->Get(0) << std::endl;
-                std::cout << "input range max: " << inputMinMax->Get(1) << std::endl;
-                std::cout << "debug: " << debugBuffer->Get(0) << std::endl;
-                int sum = 0;
-                for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
-                {
-                    sum += chunkCounter->Get(1 + i);
-                    std::cout << " total processed: " << chunkCounter->Get(1 + i) << std::endl;
-                }
-                std::cout << "sum = " << sum << std::endl;
-                std::cout << "-------------------------------" << std::endl;
-#endif
+                keyIn = std::make_shared< Sloth::Buffer<KeyType>>("keyIn", inputSize, 0, false);
+                keyOut = std::make_shared< Sloth::Buffer<KeyType>>("keyOut", inputSize, 0, false);
+                valueIn = std::make_shared< Sloth::Buffer<ValueType>>("valueIn", inputSize, 0, false);
+                valueOut = std::make_shared< Sloth::Buffer<ValueType>>("valueOut", inputSize, 0, false);
+                lastInputSize = inputSize;
             }
-            std::cout << "build gpu: " << t / 1000000000.0 << "s" << std::endl;
+            keyIn->CopyFrom(keys.data(), inputSize);
+            valueIn->CopyFrom(values.data(), inputSize);
+            // starting n tasks depending on chunk length
+            int nTasks = 1 + (inputSize / (4 * TreeInternalKernels::taskThreads));
 
-          
+            minMaxWorkCounter->Set(0, 0);
+            // compute min-max range for first step
+            inputMinMax->Set(0, TreeInternalKernels::iMax);
+            inputMinMax->Set(1, TreeInternalKernels::iMin);
+            TreeInternalKernels::minMaxReduction << <nTasks, TreeInternalKernels::taskThreads >> > (keyIn->Data(), minMaxWorkCounter->Data(), inputSize, inputMinMax->Data());
+            cudaDeviceSynchronize();
 
+            // first chunk = input array
+            // counter is to coordinate target writing form multiple inputs (multiple threads)
+            chunkCounter->Set(0, 0);
+            chunkDepth->Set(0, 0);// root is depth 0
+            chunkRangeMin->Set(0, inputMinMax->Get(0));
+            chunkRangeMax->Set(0, inputMinMax->Get(1));
+
+
+            chunkLength->Set(0, inputSize);
+            chunkOffset->Set(0, 0);// chunk starts at 0th element
+            chunkProgress->Set(0, 0); // tasks coordinate with this atomically
+
+
+            // number of tasks launched
+            taskInCounter->Set(0, nTasks);
+            std::vector<int> tasks(nTasks), tasks2(nTasks), tasks3(nTasks);
+            for (int i = 0; i < nTasks; i++)
+            {
+                tasks[i] = 0;
+                tasks2[i] = nTasks;
+                tasks3[i] = i;
+            }
+            taskInChunkId->CopyFrom(tasks.data(), nTasks);
+            taskParallelismIn->CopyFrom(tasks2.data(), nTasks);
+            taskIndexIn->CopyFrom(tasks3.data(), nTasks);
+
+
+            bool working = true;
+            int maxDebugCtr = 30;
+            while (working)
+            {
+                if (maxDebugCtr-- == 0)
+                    break;
+                taskOutCounter->Set(0, 0);
+
+
+                TreeInternalKernels::resetChunkLength << <nTasks, TreeInternalKernels::taskThreads >> > (
+                    taskIndexIn->Data(),
+                    taskParallelismIn->Data(),
+                    taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
+                    chunkLength->Data(), chunkProgress->Data(), chunkOffset->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data(),
+                    debugBuffer->Data()
+                    );
+                TreeInternalKernels::computeChildChunkAllocationRequirements << <nTasks, TreeInternalKernels::taskThreads >> > (
+                    taskIndexIn->Data(),
+                    taskParallelismIn->Data(),
+                    taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
+                    chunkLength->Data(), chunkProgress->Data(), chunkOffset->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data(),
+                    debugBuffer->Data()
+                    );
+
+                TreeInternalKernels::computeChildChunkOffset << <nTasks, TreeInternalKernels::taskThreads >> > (
+                    taskIndexIn->Data(),
+                    taskParallelismIn->Data(),
+                    taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
+                    chunkLength->Data(), chunkProgress->Data(), chunkOffset->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data(),
+                    debugBuffer->Data()
+                    );
+
+                TreeInternalKernels::allocateChildChunkAndCopy << <nTasks, TreeInternalKernels::taskThreads >> > (
+                    taskIndexIn->Data(),
+                    taskParallelismIn->Data(),
+                    taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
+                    chunkLength->Data(), chunkProgress->Data(), chunkOffset->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data(),
+                    debugBuffer->Data()
+                    );
+
+
+                TreeInternalKernels::copyChunkBack << <nTasks, TreeInternalKernels::taskThreads >> > (
+                    taskIndexIn->Data(),
+                    taskParallelismIn->Data(),
+                    taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
+                    chunkLength->Data(), chunkProgress->Data(), chunkOffset->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data(),
+                    debugBuffer->Data()
+                    );
+
+
+                // recursion part                    
+                TreeInternalKernels::createTask << <nTasks, TreeInternalKernels::taskThreads >> > (
+                    taskIndexIn->Data(),
+                    taskParallelismIn->Data(),
+                    taskInCounter->Data(), taskInChunkId->Data(), chunkDepth->Data(),
+                    chunkLength->Data(), chunkProgress->Data(), chunkOffset->Data(),
+                    chunkRangeMin->Data(), chunkRangeMax->Data(), chunkCounter->Data(), chunkType->Data(),
+                    keyIn->Data(), valueIn->Data(), keyOut->Data(), valueOut->Data(),
+                    taskOutCounter->Data(),
+                    taskOutChunkId->Data(),
+                    taskParallelismOut->Data(),
+                    taskIndexOut->Data(),
+                    debugBuffer->Data()
+                    );
+
+                gpuErrchk(cudaDeviceSynchronize());
+
+                const int numNewTasks = taskOutCounter->Get(0);
+                taskOutCounter->DeviceCopyTo(taskInCounter->Data(), 1);
+                taskOutChunkId->DeviceCopyTo(taskInChunkId->Data(), numNewTasks);
+
+                taskParallelismOut->DeviceCopyTo(taskParallelismIn->Data(), numNewTasks);
+                taskIndexOut->DeviceCopyTo(taskIndexIn->Data(), numNewTasks);
+                taskOutCounter->Set(0, 0);
+
+
+#ifdef SLOTH_DEBUG_ENABLED
+                std::cout << "num tasks = " << numNewTasks << std::endl;
+                std::cout << "debug: " << debugBuffer->Get(0) << std::endl;
+                debugBuffer->Set(0, 0);
+#endif
+                nTasks = numNewTasks;
+                working = (numNewTasks > 0);
+                // break;
+            }
+
+
+#ifdef SLOTH_DEBUG_ENABLED
+            std::cout << "input range min: " << inputMinMax->Get(0) << std::endl;
+            std::cout << "input range max: " << inputMinMax->Get(1) << std::endl;
+            std::cout << "debug: " << debugBuffer->Get(0) << std::endl;
+            int sum = 0;
+            for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
+            {
+                sum += chunkCounter->Get(1 + i);
+                std::cout << " total processed: " << chunkCounter->Get(1 + i) << std::endl;
+            }
+            std::cout << "sum = " << sum << std::endl;
+            std::cout << "-------------------------------" << std::endl;
+#endif
         }
 
         // checks existence of multiple keys in tree. Sets existence conditions in foundOut buffer and assigns values(of keys) to valuesOut buffer
@@ -1343,15 +1377,16 @@ namespace Sloth
                 searchKeyIndexOut = std::make_shared< Sloth::Buffer<int>>("sarchKeyIndexOut", n, 0, false); // to be used in optimized version
                 searchValueOut = std::make_shared< Sloth::Buffer<ValueType>>("searchValueOut", n, 0, false);
                 searchConditionOut = std::make_shared< Sloth::Buffer<char>>("searchConditionOut", n, 0, false);
-                indexQueueData = std::make_shared< Sloth::Buffer<int>>("indexQueueData", (n+64)*(1 + std::pow(TreeInternalKernels::numChildNodesPerParent, TreeInternalKernels::nodeMaxDepth)), 0, false);
+                indexStackData = std::make_shared< Sloth::Buffer<int>>("indexStackData", (n+64)*(1 + (TreeInternalKernels::numChildNodesPerParent*TreeInternalKernels::nodeMaxDepth)), 0, false);
                 lastSearchInputSize = n;
             }
-
+         
             searchKeyIn->CopyFrom(keysIn.data(),n);
             
-            TreeInternalKernels::findElements<<<1+(n/64),64>>>(
+            constexpr int nBlockThr = 64;
+            TreeInternalKernels::findElements<KeyType,ValueType,nBlockThr> <<<1+(n/ nBlockThr), nBlockThr >>>(
                 searchKeyIn->Data(), keyIn->Data(), valueIn->Data(), searchValueOut->Data(), searchConditionOut->Data(),
-                indexQueueData->Data(), chunkDepth->Data(), chunkOffset->Data(), chunkLength->Data(),
+                indexStackData->Data(), chunkDepth->Data(), chunkOffset->Data(), chunkLength->Data(),
                 chunkRangeMin->Data(), chunkRangeMax->Data(),
                 chunkType->Data(),n);
             gpuErrchk(cudaDeviceSynchronize());
