@@ -765,7 +765,7 @@ namespace Sloth
                     {
                         keyIn[copyStart + currentId] = keyOut[copyStart + currentId];
                         valueIn[copyStart + currentId] = valueOut[copyStart + currentId];
-                        ;
+                        
                     }
                 }
             }
@@ -870,7 +870,149 @@ namespace Sloth
             }
         }
 
-      
+
+        // optimized for coalesced access from all threads so global memory will be efficiently used (assuming warp divergence is not high)
+        // also branch-free
+        template<typename Type>
+        struct Queue
+        {
+        private:
+            int head;
+            int tail;
+            int n;
+            int stride;
+            int threadId;
+        public:
+            __device__ Queue(const int nData, const int nTotalThreads, const int strideThreadId)
+            {
+                head = 0; 
+                tail = 0;
+                n = nData;
+                stride = nTotalThreads;
+                threadId = strideThreadId;
+            }
+
+            // check size before calling this
+            __device__ int pop(Type* queueData)
+            {
+                const Type result = queueData[(tail % n)*stride + threadId]; // coalesced & branche-free
+                tail++;
+                return result;
+            }
+
+            __device__ int size()
+            {
+                return head-tail;
+            }
+
+            // pay attention to size to not overlow the data
+            __device__ void push(Type data, Type* queueData)
+            {
+                queueData[(head % n)*stride + threadId] = data; // coalesced & branche-free
+                head++;                
+            }
+
+        };
+
+
+        /* 
+            unoptimized high - warp - divergence version without sorting but simple
+
+            indexQueue: interleaved circular array to work as a parallel queue
+        */ 
+        template<typename KeyType, typename ValueType>
+        __global__ void findElements(
+            KeyType * searchKeyIn, KeyType * keyIn, ValueType* valueIn, ValueType * valueOut, char * conditionOut,
+            int * indexQueueData, char * chunkDepth, int * chunkOffset, int * chunkLength,
+            KeyType* chunkRangeMin, KeyType* chunkRangeMax,
+            char * chunkType, const int numElementsToCompute)
+        {
+            const int id = threadIdx.x + blockIdx.x * blockDim.x;
+            const int totalThreads = blockDim.x * gridDim.x;
+
+            const bool compute = id < numElementsToCompute;
+            KeyType key;
+            
+            if(compute)
+                key = searchKeyIn[id];
+
+            ValueType value=-1;
+            bool condition=false;
+
+
+
+            // 64k per input = maximum 100k inputs should be processed at once
+            Queue<int> indexQueue(
+                1 + std::pow(TreeInternalKernels::numChildNodesPerParent, TreeInternalKernels::nodeMaxDepth),
+                totalThreads,
+                id
+            );
+
+            // start with root node index
+            indexQueue.push(0,indexQueueData);
+
+            bool breakLoop = false;
+            
+            while (compute && indexQueue.size() > 0)
+            {
+                const int index = indexQueue.pop(indexQueueData);                
+                const int depth = chunkDepth[index];
+                const KeyType rangeMin = chunkRangeMin[index];
+                const KeyType rangeMax = chunkRangeMax[index];
+                const char type = chunkType[index];
+
+                // todo: add a syncthreads with a fully-inclusive condition check (such as if all are still running, to decrease divergence)
+
+               
+
+                
+                if (key >= rangeMin && key <= rangeMax)
+                {
+                    // leaf node, check elements
+                    if (type == 1)
+                    {
+                        const int offset = chunkOffset[index];
+                        const int length = chunkLength[index];
+                        for (int i = 0; i < length; i++)
+                        {
+                            const int elementIndex = offset + i;
+                            if (keyIn[elementIndex] == key)
+                            {
+                                value = valueIn[elementIndex];
+                                condition = true;
+                                breakLoop = true;
+                                break;
+                            }
+                        }
+                    }
+                    else if (type == 2)
+                    {
+                        for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
+                        {
+                            indexQueue.push(index * TreeInternalKernels::numChildNodesPerParent + 1 + i,indexQueueData);
+                        }
+                    }
+                    else
+                    {
+                        printf(" invalid node found "); // this should never happen
+                    }
+
+                }
+
+                if (breakLoop || (depth > TreeInternalKernels::nodeMaxDepth))
+                    break;
+            }
+
+
+            // last convergence
+            __syncthreads();
+            // write results
+            if (compute)
+            {
+                valueOut[id] = value;
+                conditionOut[id] = condition;
+            }
+        }
 
 
         __global__ void resetDebugBuffer(int * debugBuffer)
@@ -921,6 +1063,13 @@ namespace Sloth
         std::shared_ptr<Sloth::Buffer<KeyType>> keyOut;
         std::shared_ptr<Sloth::Buffer<ValueType>> valueOut;
 
+        std::shared_ptr<Sloth::Buffer<KeyType>> searchKeyIn;        
+        std::shared_ptr<Sloth::Buffer<int>> searchKeyIndexIn;
+        std::shared_ptr<Sloth::Buffer<int>> searchKeyIndexOut;
+        std::shared_ptr<Sloth::Buffer<ValueType>> searchValueOut;
+        std::shared_ptr<Sloth::Buffer<char>> searchConditionOut;
+        std::shared_ptr<Sloth::Buffer<int>> indexQueueData;
+        
 
         std::shared_ptr<Sloth::Buffer<int>> minMaxWorkCounter;
         std::shared_ptr<Sloth::Buffer<int>> inputMinMax;
@@ -928,6 +1077,7 @@ namespace Sloth
         int maxTasks;
         int maxChunks;
         int lastInputSize;
+        int lastSearchInputSize;
         int allocSize;
         int debugBufferSize;
 	public:
@@ -939,7 +1089,7 @@ namespace Sloth
             cudaSetDevice(0);
 
             lastInputSize = 0;
-
+            lastSearchInputSize = 0;
             inputMinMax = std::make_shared< Sloth::Buffer<int>>("inputMinMax",2, 0, false);
             minMaxWorkCounter = std::make_shared< Sloth::Buffer<int>>("minMaxCounter", 1, 0, false);
 
@@ -964,6 +1114,9 @@ namespace Sloth
             chunkProgress = std::make_shared< Sloth::Buffer<int>>("chunkProgress", maxChunks, 0, false);
             chunkRangeMin = std::make_shared< Sloth::Buffer<KeyType>>("chunkRangeMin", maxChunks, 0, false);
             chunkRangeMax = std::make_shared< Sloth::Buffer<KeyType>>("chunkRangeMax", maxChunks, 0, false);
+
+
+            
 
             std::vector<char> chunkTypeReset(maxChunks);
             for (int i = 0; i < maxChunks; i++)
@@ -1165,7 +1318,7 @@ namespace Sloth
         }
 
         // checks existence of multiple keys in tree. Sets existence conditions in foundOut buffer and assigns values(of keys) to valuesOut buffer
-        void FindKeyGpu(KeyType* keysIn, ValueType* valuesOut, bool * foundOut)
+        void FindKeyGpu(std::vector<KeyType> keysIn, std::vector<ValueType>& valuesOut, std::vector<char>& foundOut)
         {
             /* 
                 Same as Cpu version, but in parallel. Traversing is handled in tasks. Starts with N tasks, all tasks work on single chunk(of all inputs).
@@ -1178,6 +1331,33 @@ namespace Sloth
                 - - when "key" is same as input key, take its "value" and put it in a bucket (by stream compaction or atomics)
                 
             */ 
+            const int n = keysIn.size();
+            if (valuesOut.size() < n)
+                valuesOut.resize(n);
+            if (foundOut.size() < n)
+                foundOut.resize(n);
+            if (lastSearchInputSize < n)
+            {
+                searchKeyIn = std::make_shared< Sloth::Buffer<KeyType>>("sarchKeyIn", n, 0, false);
+                searchKeyIndexIn = std::make_shared< Sloth::Buffer<int>>("sarchKeyIndexIn", n, 0, false); // to be used in optimized version
+                searchKeyIndexOut = std::make_shared< Sloth::Buffer<int>>("sarchKeyIndexOut", n, 0, false); // to be used in optimized version
+                searchValueOut = std::make_shared< Sloth::Buffer<ValueType>>("searchValueOut", n, 0, false);
+                searchConditionOut = std::make_shared< Sloth::Buffer<char>>("searchConditionOut", n, 0, false);
+                indexQueueData = std::make_shared< Sloth::Buffer<int>>("indexQueueData", (n+64)*(1 + std::pow(TreeInternalKernels::numChildNodesPerParent, TreeInternalKernels::nodeMaxDepth)), 0, false);
+                lastSearchInputSize = n;
+            }
+
+            searchKeyIn->CopyFrom(keysIn.data(),n);
+            
+            TreeInternalKernels::findElements<<<1+(n/64),64>>>(
+                searchKeyIn->Data(), keyIn->Data(), valueIn->Data(), searchValueOut->Data(), searchConditionOut->Data(),
+                indexQueueData->Data(), chunkDepth->Data(), chunkOffset->Data(), chunkLength->Data(),
+                chunkRangeMin->Data(), chunkRangeMax->Data(),
+                chunkType->Data(),n);
+            gpuErrchk(cudaDeviceSynchronize());
+
+            searchValueOut->CopyTo(valuesOut.data(), n);
+            searchConditionOut->CopyTo(foundOut.data(), n);
         }
 
         // checks if a key is in tree, returns true if it exists. Also sets its value(of key) to the parameter "value".

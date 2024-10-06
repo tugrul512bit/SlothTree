@@ -14,12 +14,13 @@ int main()
         value[i] = i;
     }
 
-    for (int i = 0; i < 10; i++)
+    // build tests
+    for (int i = 0; i < 5; i++)
     {
         std::cout << "------------------------------------------------------------------------------------" << std::endl;
         int valueFound = -1;
         bool found = false;
-        for (int i = 0; i < 100; i++)
+        for (int i = 0; i < 5; i++)
         {
             tree.Build(key, value);
             
@@ -62,17 +63,78 @@ int main()
 
 
     std::cout << "1x brute-force cpu find: " << std::endl;
-    size_t t;
+
+
+    // search tests
+    // nSearch consumes too much video-memory. beware.
+    // it allocates enough queue-space for nSearch CUDA threads
+    // if 1 million keys are to be searched, do it in 100 steps using 10k chunks
+    const int nSearch = 10000;
+    std::vector<int> keys(nSearch);
+    std::vector<int> values(nSearch);
+    std::vector<char> conditions(nSearch);
+    std::vector<int> valuesBruteForce(nSearch);
+    std::vector<char> conditionsBruteForce(nSearch);
+    for (int i = 0; i < nSearch; i++)
     {
-        Sloth::Bench bench(&t);
-        for (int i = 0; i < n; i++)
+        keys[i] = rand() * rand() + rand();        
+    }
+
+
+    for (int j = 0; j < 3; j++)
+    {
+        size_t t;
         {
-            if ((i != 15) && (key[i] == key[15]))
+            Sloth::Bench bench(&t);
+            for (int j = 0; j < nSearch; j++)
             {
-                std::cout << "duplicate key(" << key[15] << ") found with value: " << value[i] << std::endl;
+                bool cond = false;
+                int val = -1;
+                for (int i = 0; i < n; i++)
+                {
+                    if (keys[j] == key[i])
+                    {
+                        cond = true;
+                        val = value[i];
+                        break;
+                    }
+                }
+                conditionsBruteForce[j] = cond;
+                valuesBruteForce[j] = val;
+            }
+        }
+
+        std::cout << "brute force find cpu: " << t / 1000000000.0 << "s" << std::endl;
+        for (int i = 0; i < 15; i++)
+        {
+            {
+                Sloth::Bench bench(&t);
+                tree.FindKeyGpu(keys, values, conditions);
+            }
+            std::cout << "simple find gpu: " << t / 1000000000.0 << "s" << std::endl;
+        }
+        //checking error
+        for (int i = 0; i < nSearch; i++)
+        {
+            bool fail = false;
+            if (conditionsBruteForce[i] != conditions[i])
+            {
+                std::cout << "Error: tree-find failed (condition)!" << std::endl;
+                fail = true;
+            }
+
+            if (valuesBruteForce[i] != values[i])
+            {
+                std::cout << "Error: tree-find failed (value)!" << std::endl;
+                fail = true;
+            }
+            if (fail)
+            {
+                std::cout << "tree result: " << values[i] << " brute-force result: " << valuesBruteForce[i] << std::endl;
+                std::cout << "tree condition: " << (int) conditions[i] << " brute-force condition: " <<  (int)conditionsBruteForce[i] << std::endl;
+                return 0;
             }
         }
     }
-    std::cout << "brute force find cpu: " << t / 1000000000.0 << "s" << std::endl;
     return 0;
 }
