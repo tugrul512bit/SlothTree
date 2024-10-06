@@ -947,7 +947,7 @@ namespace Sloth
         /* 
             unoptimized high - warp - divergence version without sorting but simple
 
-            indexQueue: interleaved circular array to work as a parallel queue
+            indexStack: interleaved circular array to work as a parallel stack
         */ 
         template<typename KeyType, typename ValueType, int numBlockThreads>
         __global__ void findElements(
