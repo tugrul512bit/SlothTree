@@ -1,5 +1,16 @@
 # SlothTree
 
+If a Ryzen CPU core is a strong bear, then a single CUDA pipeline a lazy sloth. If both are racing to get apples from a tree, 1 at a time, the bear always wins by a large margin:
+
+- bear: 1 apple per 15 seconds --> 240 apples per hour
+- sloth: 1 apple per hour
+
+But, when we have a lot of sloths:
+
+- 5888 sloths: 5888 apples per hour
+
+Sloths win.
+
 Building tree:
 
 Up to 40x faster than std::unordered_map for inserting same number of random elements.
