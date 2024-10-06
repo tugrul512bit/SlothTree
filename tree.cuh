@@ -4,6 +4,7 @@
 #include<iostream>
 #include<memory>
 #include<unordered_map>
+#include<queue>
 namespace Sloth
 {
 //#define SLOTH_DEBUG_ENABLED
@@ -20,7 +21,7 @@ namespace Sloth
         // each chunk can have multiple tasks
         static constexpr int taskThreads = 128;
         static constexpr int nodeElements = 1024;
-        static constexpr int nodeMaxDepth =10;
+        static constexpr int nodeMaxDepth =8;
         static constexpr int numChildNodesPerParent =4;
         
        
@@ -959,6 +960,11 @@ namespace Sloth
             chunkRangeMin = std::make_shared< Sloth::Buffer<KeyType>>("chunkRangeMin", maxChunks, 0, false);
             chunkRangeMax = std::make_shared< Sloth::Buffer<KeyType>>("chunkRangeMax", maxChunks, 0, false);
 
+            std::vector<char> chunkTypeReset(maxChunks);
+            for (int i = 0; i < maxChunks; i++)
+                chunkTypeReset[i] = 0;
+
+            chunkType->CopyFrom(chunkTypeReset.data(), maxChunks);
 
 		}
 
@@ -1151,6 +1157,65 @@ namespace Sloth
 
           
 
+        }
+
+        bool FindKeyCpu(KeyType key, ValueType & value)
+        {
+            std::queue<int> indexQueue;
+            indexQueue.push(0); // root;
+            
+            
+            while (indexQueue.size()>0)
+            {            
+                const int index = indexQueue.front();
+                indexQueue.pop();
+
+                int depth = chunkDepth->Get(index);
+                int rangeMin = chunkRangeMin->Get(index);
+                int rangeMax = chunkRangeMax->Get(index);
+                char type = chunkType->Get(index);
+
+                if (key >= rangeMin && key <= rangeMax)
+                {
+                    // leaf node, check elements
+                    if (type == 1)
+                    {
+                        const int offset = chunkOffset->Get(index);
+                        const int length = chunkLength->Get(index);
+                        for (int i = 0; i < length; i++)
+                        {
+                            const int elementIndex = offset + i;
+                            if (keyIn->Get(elementIndex) == key)
+                            {
+                                value = valueIn->Get(elementIndex);
+
+#ifdef SLOTH_DEBUG_ENABLED
+                                std::cout << "found at depth:" << depth << std::endl;
+                                std::cout << "found at range:" << rangeMin<<" "<<rangeMax << std::endl;
+#endif
+                                return true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (type == 2)
+                        {
+                            for (int i = 0; i < TreeInternalKernels::numChildNodesPerParent; i++)
+                            {
+                                indexQueue.push(index * TreeInternalKernels::numChildNodesPerParent + 1 + i);
+                            }
+                        }
+                    }
+                }
+
+              
+                if (depth > TreeInternalKernels::nodeMaxDepth)
+                    break;
+            }
+            
+
+            return false;
         }
 
 		~Tree()

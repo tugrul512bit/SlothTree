@@ -3,29 +3,33 @@
 int main()
 {
 
-        int n = 1000000;
-        Sloth::Tree<int, int> tree;
-        std::unordered_map<int, int> map;
-        std::vector<int> key(n);
-        std::vector<int> value(n);
-        for (int i = 0; i < n; i++)
+    int n = 1000000;
+    Sloth::Tree<int, int> tree;
+    std::unordered_map<int, int> map;
+    std::vector<int> key(n);
+    std::vector<int> value(n);
+    for (int i = 0; i < n; i++)
+    {
+        key[i] = rand() * rand() + rand();
+        value[i] = i;
+    }
+    for (int i = 0; i < 10; i++)
+    {
+        tree.Build(key, value);
+
+        map.clear();
+        size_t t;
         {
-            key[i] = rand();//*rand()+rand();
-            value[i] = i;
+            Sloth::Bench bench(&t);
+            for (int j = 0; j < n; j++)
+                map[key[j]] = value[j];
         }
-        for (int i = 0; i < 10; i++)
-        {
-            tree.Build(key, value);
-            
-            map.clear();
-            size_t t;
-            {
-                Sloth::Bench bench(&t);
-                for (int j = 0; j < n; j++)
-                    map[key[j]] = value[j];
-            }
-            std::cout << "cpu: " << t / 1000000000.0 << "s" << std::endl;
-            
-        }
+        std::cout << "cpu: " << t / 1000000000.0 << "s" << std::endl;
+
+    }
+
+    int valueFound=-1;
+    std::cout << " found: " << tree.FindKeyCpu(key[15],valueFound) << std::endl;
+    std::cout << " found value: " << valueFound << " real value: " << value[15] << std::endl;
     return 0;
 }
